@@ -30,10 +30,17 @@ export type ModuleResolverConfig = {
   paths?: TsPathMapping[];
 };
 
-const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"] as const;
+const SOURCE_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+] as const;
 
 function stripSourceExtension(value: string): string {
-  return value.replace(/\.(js|jsx|ts|tsx)$/, "");
+  return value.replace(/\.(js|jsx|ts|tsx|mjs|cjs)$/, "");
 }
 
 function isRelativeSpecifier(specifier: string): boolean {
@@ -172,9 +179,6 @@ export function resolveModule(
   repoRoot: string,
   resolverConfig: ModuleResolverConfig = {},
 ): ModuleResolution {
-  /*
-   * 1. Relative imports
-   */
   if (isRelativeSpecifier(specifier)) {
     const importerDir = path.posix.dirname(importer);
 
@@ -198,9 +202,6 @@ export function resolveModule(
     };
   }
 
-  /*
-   * 2. Configured TypeScript path aliases
-   */
   const hasMatchingAlias = (resolverConfig.paths ?? []).some((mapping) =>
     isAliasPatternMatch(mapping.pattern, specifier),
   );
@@ -227,9 +228,6 @@ export function resolveModule(
     };
   }
 
-  /*
-   * 3. baseUrl imports
-   */
   if (resolverConfig.baseUrl) {
     const candidate = path.posix.normalize(
       path.posix.join(repoRoot, resolverConfig.baseUrl, specifier),
@@ -246,9 +244,6 @@ export function resolveModule(
     }
   }
 
-  /*
-   * 4. Everything else is a package/external module.
-   */
   return {
     kind: "external",
     source: specifier,

@@ -19,7 +19,10 @@ import { useProjectData } from "@/hooks/useProjectData";
 import { useFileHandler } from "@/hooks/useFileHandler";
 import { getLanguage } from "../utils/language";
 import ProjectWorkspaceTabs from "../components/ProjectWorkspaceTabs";
-import { FlowGraph } from "@/app/api/lib/analyzer/types";
+import {
+  FlowGraph,
+  ProjectDependencyAnalysis,
+} from "@/app/api/lib/analyzer/types";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -123,6 +126,10 @@ export default function ProjectDetailPage() {
     };
     getReadMeData();
   }, [graphReady, isLoaded, project]);
+
+  const dependencyAnalysis = project?.dependencyAnalysis as
+    | ProjectDependencyAnalysis
+    | undefined;
 
   const handleDelete = async () => {
     const token = await getAuth().currentUser?.getIdToken();
@@ -298,17 +305,19 @@ export default function ProjectDetailPage() {
 
           <div className="col-span-12 xl:col-span-7 flex min-w-0">
             <FileViewerPanel
+              id={project.projectId}
               projectId={project._id}
               project={project}
+              handleFileClick={handleFileClick}
+              fileTree={filteredTree}
               graphData={graphData}
               setGraphData={setGraphData}
-              setProject={setProject}
-              fileTree={filteredTree || project.fileTree}
               selectedPath={selectedPath}
               setSelectedPath={setSelectedPath}
               fileContent={fileContent}
               lineNumber={line}
               selectedFileNode={selectedFileNode}
+              dependencyAnalysis={dependencyAnalysis}
               readmeContent={readmeContent}
               readmeSummary={readmeSummary}
               getLanguageMeta={getLanguage}

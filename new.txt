@@ -1,0 +1,5627 @@
+--------------------------- complete backend graph flow ---------------------------
+
+// jobworker.ts
+
+import fs from "fs";
+import path from "path";
+import AdmZip from "adm-zip";
+import clientPromise from "../../../../lib/mongoClient";
+import { saveJob } from "./jobStore";
+import { instrumentExecutionBabel } from "../instrumentExecutionBabel";
+import { normalizeGraphIds } from "../analyzer/normalizeGraphIds";
+import { attachCrossFileImpact } from "../buildCrossFileImpactMap";
+import { detectLanguage } from "../language";
+import {
+  deleteStaleFileGraphs,
+  getFileGraphs,
+  saveFileGraphs,
+} from "../graph/graphStore";
+import {
+  buildFileTree,
+  calculateRepositoryInsights,
+  detectTags,
+} from "../uploadHelpers";
+import {
+  cleanOldCache,
+  ensureCacheRoot,
+  getProjectCachePath,
+  touchCache,
+} from "../cache/extractCache";
+import {
+  createModuleResolverConfig,
+  type ModuleResolverConfig,
+} from "../analyzer/moduleResolverConfig";
+import { isDeadFileCandidateRole } from "../analyzer/fileRoleClassifier";
+import {
+  computeFileImportanceDistributed,
+  findCircularFileDependencies,
+  findDeadFilesDistributed,
+} from "../analyzer/distributedImpactEngine";
+import { summarizeFileGraphs } from "../analyzer/fileGraphSummary";
+import { collectFileDependencies } from "../analyzer/fileDependecies";
+import {
+  calculateFileConnectivityMetrics,
+  calculateProjectDegrees,
+  enrichFileGraphSemantics,
+} from "../analyzer/enrichFileGraphSemantics";
+import { ProjectDependencyAnalysis } from "../analyzer/types";
+
+const CHUNK_SIZE = 50;
+
+function isBinaryFile(buffer: Buffer) {
+  return buffer.includes(0);
+}
+
+function isGraphSupportedFile(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+
+  return [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext);
+}
+
+const IGNORE_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".turbo",
+  ".cache",
+]);
+
+function walkDir(root: string): string[] {
+  const results: string[] = [];
+
+  function walk(dir: string) {
+    for (const item of fs.readdirSync(dir)) {
+      if (IGNORE_DIRS.has(item)) continue;
+
+      const full = path.join(dir, item);
+      const stat = fs.statSync(full);
+
+      if (stat.isDirectory()) {
+        walk(full);
+      } else {
+        results.push(full);
+      }
+    }
+  }
+
+  walk(root);
+  return results;
+}
+
+function withTimeout(promise: any, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Timeout")), ms),
+    ),
+  ]);
+}
+
+function normalizeFilePath(value: string) {
+  return value.replace(/\\/g, "/");
+}
+
+function collectFileAnalysisScopes(fileTree: any[]) {
+  const entryFileIds = new Set<string>();
+  const candidateFileIds = new Set<string>();
+
+  const collect = (nodes: any[]) => {
+    for (const node of nodes) {
+      if (node.type === "file" && node.fullPath) {
+        const normalizedPath = normalizeFilePath(node.fullPath);
+        const fileId = `file::${normalizedPath}`;
+
+        if (node.entry?.isLikelyEntry && node.entry?.kind !== "cli") {
+          entryFileIds.add(fileId);
+        }
+
+        if (isDeadFileCandidateRole(node.role)) {
+          candidateFileIds.add(fileId);
+        }
+      }
+
+      if (Array.isArray(node.children)) {
+        collect(node.children);
+      }
+    }
+  };
+
+  collect(fileTree);
+
+  return {
+    entryFileIds,
+    candidateFileIds,
+  };
+}
+
+function collectFileUniverse(fileTree: any[]) {
+  const fileIds = new Set<string>();
+  const filePaths = new Set<string>();
+
+  const collect = (nodes: any[]) => {
+    for (const node of nodes) {
+      if (node.type === "file" && node.fullPath) {
+        const normalizedPath = normalizeFilePath(node.fullPath);
+
+        filePaths.add(normalizedPath);
+        fileIds.add(`file::${normalizedPath}`);
+      }
+
+      if (Array.isArray(node.children)) {
+        collect(node.children);
+      }
+    }
+  };
+
+  collect(fileTree);
+
+  return {
+    fileIds,
+    filePaths,
+  };
+}
+
+export async function runJobStep(job: any) {
+  if (job.status === "done") return;
+
+  const db = (await clientPromise).db();
+
+  if (!job.extractedPath) {
+    const project = await db
+      .collection("projects")
+      .findOne({ projectId: job.projectId });
+
+    ensureCacheRoot();
+
+    const root = getProjectCachePath(job.projectId);
+
+    fs.mkdirSync(root, { recursive: true });
+
+    const extractRoot = path.join(root, "repo");
+
+    touchCache(job.projectId);
+
+    fs.mkdirSync(extractRoot, { recursive: true });
+
+    const zipPath = project?.uploadPath;
+
+    let lastSize = -1;
+    let stableCount = 0;
+
+    for (let i = 0; i < 60; i++) {
+      if (zipPath && fs.existsSync(zipPath)) {
+        const size = fs.statSync(zipPath).size;
+
+        if (size === lastSize) {
+          stableCount++;
+
+          if (stableCount >= 3) break;
+        } else {
+          stableCount = 0;
+          lastSize = size;
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    if (!zipPath || !fs.existsSync(zipPath)) {
+      throw new Error("zip not ready");
+    }
+
+    new AdmZip(zipPath).extractAllTo(extractRoot, true);
+
+    cleanOldCache();
+
+    await saveJob({
+      id: job.id,
+      extractedPath: root,
+      step: "scan",
+      status: "running",
+      progress: 2,
+      message: "Repository extracted",
+    });
+
+    return;
+  }
+
+  if (job.step === "scan") {
+    const root = path.join(job.extractedPath, "repo");
+
+    if (!job.scanFiles) {
+      const scanFiles = walkDir(root);
+
+      await saveJob({
+        id: job.id,
+        scanFiles,
+        scanCursor: 0,
+        totalFiles: scanFiles.length,
+        progress: 5,
+        message: "Scanning repository",
+      });
+
+      return;
+    }
+
+    await saveJob({
+      id: job.id,
+      step: "metadata",
+      progress: 8,
+      message: "Scan complete",
+    });
+
+    return;
+  }
+
+  if (job.step === "metadata") {
+    const root = path.join(job.extractedPath, "repo");
+
+    const allFiles = job.scanFiles.map((abs: string) =>
+      path.relative(root, abs).split(path.sep).join("/"),
+    );
+
+    let resolverConfig: ModuleResolverConfig = {
+      baseUrl: "",
+      paths: [],
+    };
+
+    const tsconfigPath = allFiles.find(
+      (file: string) =>
+        file === "tsconfig.json" || file.endsWith("/tsconfig.json"),
+    );
+
+    if (tsconfigPath) {
+      try {
+        const abs = path.join(root, tsconfigPath);
+        const parsed = JSON.parse(fs.readFileSync(abs, "utf-8"));
+
+        resolverConfig = createModuleResolverConfig(parsed);
+      } catch {}
+    }
+
+    const fileTree = await buildFileTree(allFiles, root);
+    const insights = calculateRepositoryInsights(fileTree);
+
+    let packageInfo = null;
+
+    const pkgPath = allFiles.find((f: string) => f.endsWith("package.json"));
+
+    if (pkgPath) {
+      try {
+        const abs = path.join(root, pkgPath);
+        const parsed = JSON.parse(fs.readFileSync(abs, "utf-8"));
+
+        packageInfo = {
+          name: parsed.name,
+          version: parsed.version,
+          scripts: parsed.scripts || {},
+          dependencies: parsed.dependencies || {},
+          devDependencies: parsed.devDependencies || {},
+        };
+      } catch {}
+    }
+
+    const entryPoints: string[] = [];
+
+    const walkTree = (nodes: any[]) => {
+      for (const n of nodes) {
+        if (n.type === "file" && n.entry.isLikelyEntry) {
+          entryPoints.push(n.fullPath);
+        }
+        if (n.children) walkTree(n.children);
+      }
+    };
+
+    walkTree(fileTree);
+
+    const tags = detectTags(packageInfo, fileTree);
+
+    await db.collection("projects").updateOne(
+      { projectId: job.projectId },
+      {
+        $set: {
+          fileTree,
+          insights,
+          packageInfo,
+          entryPoints,
+          tags,
+          resolverConfig,
+        },
+      },
+    );
+
+    await saveJob({
+      id: job.id,
+      step: "file-analysis",
+      cursor: 0,
+      progress: 12,
+      message: "Metadata extracted",
+    });
+
+    return;
+  }
+
+  if (job.step === "file-analysis") {
+    const cursor = job.cursor ?? 0;
+
+    const files = job.scanFiles || [];
+    const project = await db.collection("projects").findOne({
+      projectId: job.projectId,
+    });
+
+    const fileTree = project?.fileTree || [];
+
+    const fileMetadataMap = new Map();
+
+    function flattenTree(nodes: any[]) {
+      for (const node of nodes) {
+        if (node.type === "file" && node.fullPath) {
+          fileMetadataMap.set(node.fullPath, {
+            functions: node.functions || [],
+            classes: node.classes || [],
+            imports: node.imports || [],
+            exports: node.exports || [],
+            components: node.components || [],
+          });
+        }
+
+        if (node.children) {
+          flattenTree(node.children);
+        }
+      }
+    }
+
+    flattenTree(fileTree);
+
+    const slice = files.slice(cursor, cursor + CHUNK_SIZE);
+    const MAX_DB_FILE_SIZE = 100 * 1024;
+    const PARALLEL = 5;
+
+    for (let i = 0; i < slice.length; i += PARALLEL) {
+      const batch = slice.slice(i, i + PARALLEL);
+
+      const results = await Promise.all(
+        batch.map(async (absPath: any) => {
+          const relPath = path
+            .relative(path.join(job.extractedPath, "repo"), absPath)
+            .split(path.sep)
+            .join("/");
+
+          const fileMeta = fileMetadataMap.get(relPath);
+
+          let content = "";
+
+          try {
+            const buf = fs.readFileSync(absPath);
+            if (!isBinaryFile(buf)) {
+              content = buf.toString("utf-8");
+            }
+          } catch {}
+
+          let stat;
+          try {
+            stat = fs.statSync(absPath);
+          } catch {
+            return null;
+          }
+
+          let graph: any = { nodes: [], edges: [] };
+
+          try {
+            if (isGraphSupportedFile(absPath)) {
+              const result = await withTimeout(
+                instrumentExecutionBabel(content),
+                5000,
+              );
+
+              if (result?.nodes && result?.edges) {
+                graph = normalizeGraphIds(result, relPath);
+              }
+            }
+          } catch {}
+
+          return {
+            relPath,
+            stat,
+            content,
+            absPath,
+            graph,
+            functions: fileMeta?.functions || [],
+            classes: fileMeta?.classes || [],
+            imports: fileMeta?.imports || [],
+            exports: fileMeta?.exports || [],
+            components: fileMeta?.components || [],
+          };
+        }),
+      );
+
+      const docs = results.filter(Boolean).map((r: any) => ({
+        updateOne: {
+          filter: {
+            projectId: job.projectId,
+            path: r.relPath,
+          },
+          update: {
+            $set: {
+              projectId: job.projectId,
+              path: r.relPath,
+              size: r.stat.size,
+              language: detectLanguage(r.relPath),
+              isCode: isGraphSupportedFile(r.relPath),
+              content: r.stat.size <= MAX_DB_FILE_SIZE ? r.content : undefined,
+              functions: r.functions,
+              classes: r.classes,
+              imports: r.imports,
+              exports: r.exports,
+              components: r.components,
+            },
+          },
+          upsert: true,
+        },
+      }));
+
+      if (docs.length) {
+        await db.collection("project_files").bulkWrite(docs);
+      }
+
+      const fileGraphDocs = results
+        .filter(
+          (r: any): r is NonNullable<typeof r> =>
+            Boolean(r) && isGraphSupportedFile(r.relPath),
+        )
+        .map((r: any) => ({
+          filePath: r.relPath,
+          nodes: r.graph?.nodes ?? [],
+          edges: r.graph?.edges ?? [],
+          meta: {
+            file: r.relPath,
+            nodeCount: r.graph?.nodes?.length ?? 0,
+            edgeCount: r.graph?.edges?.length ?? 0,
+            mode: "execution",
+            generatedAt: new Date(),
+          },
+        }));
+
+      if (fileGraphDocs.length) {
+        await saveFileGraphs(job.projectId, fileGraphDocs, job.ownerId);
+      }
+    }
+
+    const newCursor = Math.min(cursor + CHUNK_SIZE, files.length);
+
+    const total = files.length;
+    const progress = total === 0 ? 60 : Math.round((newCursor / total) * 60);
+
+    if (newCursor >= total) {
+      const activeFilePaths = files
+        .map((absPath: string) =>
+          path
+            .relative(path.join(job.extractedPath, "repo"), absPath)
+            .split(path.sep)
+            .join("/"),
+        )
+        .filter(isGraphSupportedFile);
+
+      await deleteStaleFileGraphs(job.projectId, activeFilePaths, job.ownerId);
+    }
+
+    await saveJob({
+      id: job.id,
+      cursor: newCursor,
+      progress,
+      step: newCursor >= total ? "enrich" : "file-analysis",
+      message: `Analyzed ${newCursor}/${total}`,
+    });
+
+    return;
+  }
+
+  if (job.step === "enrich") {
+    const project = await db.collection("projects").findOne({
+      projectId: job.projectId,
+      members: job.ownerId,
+    });
+
+    const fileTree = project?.fileTree || [];
+
+    const resolverConfig = project?.resolverConfig ?? {};
+
+    attachCrossFileImpact(fileTree, resolverConfig);
+
+    await db.collection("projects").updateOne(
+      {
+        projectId: job.projectId,
+        members: job.ownerId,
+      },
+      {
+        $set: {
+          fileTree,
+        },
+      },
+    );
+
+    const storedFileGraphs = await getFileGraphs(job.projectId, job.ownerId);
+
+    const fileGraphs = storedFileGraphs.map((doc: any) => ({
+      file: doc.filePath,
+      graph: {
+        nodes: doc.nodes ?? [],
+        edges: doc.edges ?? [],
+        meta: doc.meta ?? {},
+      },
+    }));
+
+    console.log("[enrich] Loaded file graphs:", {
+      files: fileGraphs.length,
+    });
+
+    const { dependencies, missingNodes } = collectFileDependencies(fileTree);
+
+    console.log("[enrich] Project dependencies:", {
+      dependencies: dependencies.length,
+      missingNodes: missingNodes.length,
+    });
+
+    const summaries = summarizeFileGraphs(fileGraphs);
+
+    const summariesByFile = new Map(
+      summaries.map((summary) => [summary.file, summary]),
+    );
+
+    const { fileIds } = collectFileUniverse(fileTree);
+
+    const { maxDegree, degrees } = calculateProjectDegrees(fileGraphs);
+
+    console.log("[enrich] Execution degree summary:", {
+      maxDegree,
+      degreeNodes: degrees.size,
+    });
+
+    const { maxDegree: maxFileDegree, metrics: fileConnectivityMetrics } =
+      calculateFileConnectivityMetrics(dependencies, fileIds);
+
+    console.log("[enrich] File connectivity summary:", {
+      maxFileDegree,
+      files: fileConnectivityMetrics.length,
+    });
+
+    const { entryFileIds, candidateFileIds } =
+      collectFileAnalysisScopes(fileTree);
+
+    const distributedCircularDeps = findCircularFileDependencies(
+      dependencies,
+      fileIds,
+    );
+
+    const distributedDeadFiles = findDeadFilesDistributed({
+      fileIds,
+      entryFileIds,
+      candidateFileIds,
+      dependencies,
+    });
+
+    const distributedImportance = computeFileImportanceDistributed({
+      fileIds,
+      dependencies,
+      apiCounts: new Map(),
+    }).slice(0, 20);
+
+    const executionNodeCount = fileGraphs.reduce(
+      (total, { graph }) => total + (graph.nodes?.length ?? 0),
+      0,
+    );
+
+    const executionEdgeCount = fileGraphs.reduce(
+      (total, { graph }) => total + (graph.edges?.length ?? 0),
+      0,
+    );
+
+    const dependencyCount = dependencies.filter(
+      (dependency) => dependency.label === "imports",
+    ).length;
+
+    const dependencyAnalysis: ProjectDependencyAnalysis = {
+      version: 2,
+      generatedAt: new Date(),
+
+      stats: {
+        fileCount: fileIds.size,
+        executionNodeCount,
+        executionEdgeCount,
+        dependencyCount,
+        missingDependencyCount: missingNodes.length,
+      },
+
+      fileMetrics: fileConnectivityMetrics,
+
+      intelligence: {
+        deadFiles: distributedDeadFiles,
+        circularDependencies: distributedCircularDeps,
+        importanceRanking: distributedImportance,
+      },
+    };
+
+    const enrichedFileGraphs = fileGraphs.map(({ file, graph }) => {
+      const summary = summariesByFile.get(file);
+
+      const enriched = enrichFileGraphSemantics(
+        graph,
+        maxDegree,
+        degrees,
+        file,
+        summary?.entryNodeIds ?? [],
+      );
+
+      return {
+        filePath: file,
+        nodes: enriched.nodes,
+        edges: enriched.edges,
+        meta: {
+          ...(graph.meta || {}),
+          ...(enriched.meta || {}),
+          nodeCount: enriched.nodes.length,
+          edgeCount: enriched.edges.length,
+          mode: graph.meta?.mode ?? "execution",
+          generatedAt: new Date(),
+        },
+      };
+    });
+
+    if (enrichedFileGraphs.length) {
+      await saveFileGraphs(job.projectId, enrichedFileGraphs, job.ownerId);
+    }
+
+    console.log("[enrich] Saved enriched file graphs:", {
+      files: enrichedFileGraphs.length,
+    });
+
+    await db.collection("projects").updateOne(
+      {
+        projectId: job.projectId,
+      },
+      {
+        $set: {
+          dependencyAnalysis,
+        },
+      },
+    );
+
+    console.log("[intelligence] Distributed:", {
+      deadFiles: distributedDeadFiles.length,
+      circularDependencies: distributedCircularDeps.length,
+      importanceRanking: distributedImportance.length,
+    });
+
+    await saveJob({
+      ...job,
+      step: "save",
+      progress: 90,
+      message: "Enriched file graphs",
+    });
+
+    return;
+  }
+
+  if (job.step === "save") {
+    await saveJob({
+      ...job,
+      status: "done",
+      step: "done",
+      progress: 100,
+      message: "Completed",
+    });
+
+    await db.collection("projects").updateOne(
+      { projectId: job.projectId },
+      {
+        $set: {
+          analysisComplete: true,
+        },
+      },
+    );
+
+    return;
+  }
+}
+
+// instrumentExecutionBabel
+
+import * as babelParser from "@babel/parser";
+import generate from "@babel/generator";
+import * as t from "@babel/types";
+import { FlowEdge, FlowGraph, FlowNode } from "./analyzer/types";
+
+export function instrumentExecutionBabel(code: string): FlowGraph {
+  let idCounter = 0;
+  const makeId = (prefix = "n") => `${prefix}#${Date.now()}_${++idCounter}`;
+
+  const tryGen = (node?: t.Node | null) => {
+    if (!node) return undefined;
+    try {
+      return generate(node as any, { concise: true }).code;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const nodes: FlowNode[] = [];
+  const edges: FlowEdge[] = [];
+
+  const addNode = (node: FlowNode) => {
+    nodes.push(node);
+    return node;
+  };
+
+  const addEdge = (from: FlowNode, to: FlowNode, label?: string) => {
+    edges.push({ id: `${from.id}->${to.id}`, from: from.id, to: to.id, label });
+  };
+
+  const handleStatementSequence = (
+    stmts: t.Statement[],
+    parentNode?: FlowNode,
+  ) => {
+    let prevNodes: FlowNode[] = [];
+
+    for (const s of stmts) {
+      const line = s.loc?.start?.line ?? 0;
+      const code = tryGen(s)?.slice(0, 400);
+
+      if (
+        !code ||
+        code.startsWith('"use strict"') ||
+        code.startsWith("'use strict'")
+      ) {
+        continue;
+      }
+
+      if (t.isIfStatement(s)) {
+        const exits = handleIfStatement(
+          s,
+          prevNodes.length > 0 ? prevNodes[0] : parentNode,
+        );
+
+        prevNodes = exits;
+        parentNode = undefined;
+      }
+
+      const nodeType =
+        t.isForStatement(s) ||
+        t.isWhileStatement(s) ||
+        t.isDoWhileStatement(s) ||
+        t.isForOfStatement(s) ||
+        t.isForInStatement(s)
+          ? "loop"
+          : t.isFunctionDeclaration(s) || t.isFunctionExpression(s)
+            ? "function"
+            : "statement";
+
+      const node: FlowNode = addNode({
+        id: makeId(nodeType),
+        type: nodeType,
+        line,
+        code,
+      });
+
+      if (parentNode) {
+        addEdge(parentNode, node, "executes");
+      }
+
+      for (const p of prevNodes) {
+        addEdge(p, node, "next");
+      }
+      prevNodes = [node];
+
+      if (
+        t.isForStatement(s) ||
+        t.isWhileStatement(s) ||
+        t.isDoWhileStatement(s) ||
+        t.isForOfStatement(s) ||
+        t.isForInStatement(s)
+      ) {
+        handleLoopStatement(s as any, node);
+      } else if (t.isFunctionDeclaration(s) || t.isFunctionExpression(s)) {
+        const fnDecl = s as t.FunctionDeclaration | t.FunctionExpression;
+        const fnName = (fnDecl as any).id?.name ?? "anonymous";
+
+        const fnNode: FlowNode = addNode({
+          id: makeId("fn"),
+          type: "function",
+          name: fnName,
+          line,
+          code: tryGen(fnDecl)?.slice(0, 400),
+        });
+
+        addEdge(node, fnNode, "declares");
+
+        if (fnDecl.body && t.isBlockStatement(fnDecl.body)) {
+          const body = fnDecl.body.body;
+          if (body.length) {
+            const first = body[0];
+            const entry: FlowNode = addNode({
+              id: makeId("fn-entry"),
+              type: "fn-entry",
+              code: tryGen(first)?.slice(0, 300),
+              line: first.loc?.start.line ?? line,
+            });
+            addEdge(fnNode, entry, "entry");
+            handleStatementSequence(body, entry);
+          }
+        }
+      }
+    }
+
+    return prevNodes;
+  };
+
+  const handleIfStatement = (
+    node: t.IfStatement,
+    containerNode?: FlowNode | null,
+  ): FlowNode[] => {
+    const exits: FlowNode[] = [];
+
+    const ifNode: FlowNode = addNode({
+      id: makeId("if"),
+      type: "if",
+      code: tryGen(node.test),
+      line: node.loc?.start?.line ?? 0,
+    });
+
+    if (containerNode) {
+      addEdge(containerNode, ifNode, "if");
+    }
+
+    if (node.consequent) {
+      if (t.isBlockStatement(node.consequent) && node.consequent.body.length) {
+        const first = node.consequent.body[0];
+        const entry = addNode({
+          id: makeId("if-true"),
+          type: "if-true",
+          code: tryGen(first)?.slice(0, 300),
+          line: first.loc?.start?.line ?? 0,
+        });
+        addEdge(ifNode, entry, "true");
+
+        const branchExits = handleStatementSequence(
+          node.consequent.body,
+          entry,
+        );
+        exits.push(...branchExits);
+      } else if (t.isStatement(node.consequent)) {
+        const single = addNode({
+          id: makeId("if-true"),
+          type: "if-true",
+          code: tryGen(node.consequent)?.slice(0, 300),
+          line: node.consequent.loc?.start?.line ?? 0,
+        });
+        addEdge(ifNode, single, "true");
+        exits.push(single);
+      }
+    } else {
+      exits.push(ifNode);
+    }
+
+    if (node.alternate) {
+      if (t.isBlockStatement(node.alternate) && node.alternate.body.length) {
+        const first = node.alternate.body[0];
+        const entry = addNode({
+          id: makeId("if-false"),
+          type: "if-false",
+          code: tryGen(first)?.slice(0, 300),
+          line: first.loc?.start?.line ?? 0,
+        });
+        addEdge(ifNode, entry, "false");
+
+        const branchExits = handleStatementSequence(node.alternate.body, entry);
+        exits.push(...branchExits);
+      } else if (t.isStatement(node.alternate)) {
+        const single = addNode({
+          id: makeId("if-false"),
+          type: "if-false",
+          code: tryGen(node.alternate)?.slice(0, 300),
+          line: node.alternate.loc?.start?.line ?? 0,
+        });
+        addEdge(ifNode, single, "false");
+        exits.push(single);
+      }
+    } else {
+      exits.push(ifNode);
+    }
+
+    return exits;
+  };
+
+  const handleLoopStatement = (
+    node: t.Statement & any,
+    containerNode: FlowNode,
+  ) => {
+    const cond = tryGen(node.test ?? node.right ?? node.init) ?? tryGen(node);
+    const loopNode: FlowNode = addNode({
+      id: makeId("loop"),
+      type: "loop",
+      code: cond,
+      line: node.loc?.start?.line ?? 0,
+    });
+    addEdge(containerNode, loopNode, "loop");
+
+    if (node.body && t.isBlockStatement(node.body) && node.body.body.length) {
+      const first = node.body.body[0];
+      const entry = addNode({
+        id: makeId("loop-body"),
+        type: "loop-body",
+        code: tryGen(first)?.slice(0, 300),
+        line: first.loc?.start?.line ?? 0,
+      });
+      addEdge(loopNode, entry, "body");
+
+      const innerExits = handleStatementSequence(node.body.body, entry);
+      for (const exitNode of innerExits) {
+        addEdge(exitNode, loopNode, "back");
+      }
+
+      const after = addNode({
+        id: makeId("after-loop"),
+        type: "after-loop",
+        code: "after loop",
+      });
+      addEdge(loopNode, after, "exit");
+    } else if (node.body) {
+      const entry = addNode({
+        id: makeId("loop-body"),
+        type: "loop-body",
+        code: tryGen(node.body)?.slice(0, 300),
+      });
+      addEdge(loopNode, entry, "body");
+      if (t.isStatement(node.body)) handleStatementSequence([node.body], entry);
+    }
+  };
+
+  try {
+    const ast = babelParser.parse(code, {
+      sourceType: "unambiguous",
+      allowReturnOutsideFunction: true,
+      errorRecovery: true,
+      plugins: [
+        "typescript",
+        "jsx",
+        ["decorators", { decoratorsBeforeExport: false }],
+        "classProperties",
+        "classPrivateProperties",
+        "classPrivateMethods",
+        "dynamicImport",
+        "optionalChaining",
+        "nullishCoalescingOperator",
+      ],
+    });
+
+    const prog = ast.program;
+
+    const rootNode: FlowNode = addNode({
+      id: "root",
+      type: "root",
+      code: "root",
+      line: 0,
+    });
+
+    handleStatementSequence(prog.body as any as t.Statement[], rootNode);
+  } catch (err: any) {
+    const errNode: FlowNode = addNode({
+      id: makeId("error"),
+      type: "error",
+      code: String(err?.message ?? err),
+    });
+  }
+
+  return { nodes, edges };
+}
+
+// normalizeGraphIds
+
+import type { FlowGraph, FlowNode, FlowEdge } from "./types";
+
+export function normalizeGraphIds(g: FlowGraph, filePath: string) {
+  let counter = 0;
+  const mapping = new Map<string, string>();
+
+  const nodes: FlowNode[] = g.nodes.map((n) => {
+    const localId = `${filePath}::${n.type}::${counter++}`;
+    mapping.set(n.id, localId);
+    return { ...n, id: localId, file: filePath };
+  });
+
+  const edges: FlowEdge[] = g.edges
+    .map((e: any) => {
+      const from = mapping.get(e.from);
+      const to = mapping.get(e.to);
+      if (!from || !to) return null;
+      return { id: `${from}->${to}`, from, to, label: e.label } as FlowEdge;
+    })
+    .filter(Boolean) as FlowEdge[];
+
+  return { nodes, edges } as FlowGraph;
+}
+
+// buildCrossFileImpactMap
+
+import path from "path";
+
+type ForwardImpact = {
+  imports: string[];
+  brokenImports: { source: string }[];
+};
+
+export type ModuleResolution =
+  | {
+      kind: "internal";
+      path: string;
+      source: string;
+    }
+  | {
+      kind: "external";
+      source: string;
+    }
+  | {
+      kind: "unresolved";
+      source: string;
+    };
+
+export type TsPathMapping = {
+  pattern: string;
+  targets: string[];
+};
+
+export type ModuleResolverConfig = {
+  baseUrl?: string;
+  paths?: TsPathMapping[];
+};
+
+const SOURCE_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+] as const;
+
+function stripSourceExtension(value: string): string {
+  return value.replace(/\.(js|jsx|ts|tsx|mjs|cjs)$/, "");
+}
+
+function isRelativeSpecifier(specifier: string): boolean {
+  return (
+    specifier === "." ||
+    specifier === ".." ||
+    specifier.startsWith("./") ||
+    specifier.startsWith("../")
+  );
+}
+
+function isAliasPatternMatch(pattern: string, specifier: string): boolean {
+  if (pattern === specifier) {
+    return true;
+  }
+
+  if (!pattern.includes("*")) {
+    return false;
+  }
+
+  const [prefix, suffix] = pattern.split("*");
+
+  return specifier.startsWith(prefix) && specifier.endsWith(suffix);
+}
+
+function getAliasWildcardValue(
+  pattern: string,
+  specifier: string,
+): string | null {
+  const starIndex = pattern.indexOf("*");
+
+  if (starIndex === -1) {
+    return pattern === specifier ? "" : null;
+  }
+
+  const prefix = pattern.slice(0, starIndex);
+  const suffix = pattern.slice(starIndex + 1);
+
+  if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) {
+    return null;
+  }
+
+  return specifier.slice(
+    prefix.length,
+    specifier.length - suffix.length || undefined,
+  );
+}
+
+function expandPathTarget(target: string, wildcardValue: string): string {
+  return target.replace(/\*/g, wildcardValue);
+}
+
+function candidatePaths(candidate: string): string[] {
+  const normalized = path.posix.normalize(candidate);
+
+  const hasExplicitSourceExtension = SOURCE_EXTENSIONS.some((extension) =>
+    normalized.endsWith(extension),
+  );
+
+  if (hasExplicitSourceExtension) {
+    return [normalized];
+  }
+
+  const candidates: string[] = [normalized, stripSourceExtension(normalized)];
+
+  for (const extension of SOURCE_EXTENSIONS) {
+    candidates.push(`${normalized}${extension}`);
+  }
+
+  for (const extension of SOURCE_EXTENSIONS) {
+    candidates.push(`${stripSourceExtension(normalized)}${extension}`);
+  }
+
+  for (const extension of SOURCE_EXTENSIONS) {
+    candidates.push(`${normalized}/index${extension}`);
+  }
+
+  return candidates;
+}
+
+function lookupInternalFile(
+  candidate: string,
+  fileLookup: Map<string, string>,
+): string | null {
+  for (const lookupCandidate of candidatePaths(candidate)) {
+    const resolved = fileLookup.get(lookupCandidate);
+
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function resolveAlias(
+  specifier: string,
+  fileLookup: Map<string, string>,
+  repoRoot: string,
+  config: ModuleResolverConfig,
+): string | null {
+  for (const mapping of config.paths ?? []) {
+    if (!isAliasPatternMatch(mapping.pattern, specifier)) {
+      continue;
+    }
+
+    const wildcardValue =
+      getAliasWildcardValue(mapping.pattern, specifier) ?? "";
+
+    for (const target of mapping.targets) {
+      const expandedTarget = expandPathTarget(target, wildcardValue);
+
+      const baseUrl = config.baseUrl || ".";
+
+      const candidate = path.posix.normalize(
+        path.posix.join(repoRoot, baseUrl, expandedTarget),
+      );
+
+      const resolved = lookupInternalFile(candidate, fileLookup);
+
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+export function resolveModule(
+  importer: string,
+  specifier: string,
+  fileLookup: Map<string, string>,
+  repoRoot: string,
+  resolverConfig: ModuleResolverConfig = {},
+): ModuleResolution {
+  if (isRelativeSpecifier(specifier)) {
+    const importerDir = path.posix.dirname(importer);
+
+    const candidate = path.posix.normalize(
+      path.posix.join(importerDir, specifier),
+    );
+
+    const resolved = lookupInternalFile(candidate, fileLookup);
+
+    if (resolved) {
+      return {
+        kind: "internal",
+        path: resolved,
+        source: specifier,
+      };
+    }
+
+    return {
+      kind: "unresolved",
+      source: specifier,
+    };
+  }
+
+  const hasMatchingAlias = (resolverConfig.paths ?? []).some((mapping) =>
+    isAliasPatternMatch(mapping.pattern, specifier),
+  );
+
+  if (hasMatchingAlias) {
+    const resolved = resolveAlias(
+      specifier,
+      fileLookup,
+      repoRoot,
+      resolverConfig,
+    );
+
+    if (resolved) {
+      return {
+        kind: "internal",
+        path: resolved,
+        source: specifier,
+      };
+    }
+
+    return {
+      kind: "unresolved",
+      source: specifier,
+    };
+  }
+
+  if (resolverConfig.baseUrl) {
+    const candidate = path.posix.normalize(
+      path.posix.join(repoRoot, resolverConfig.baseUrl, specifier),
+    );
+
+    const resolved = lookupInternalFile(candidate, fileLookup);
+
+    if (resolved) {
+      return {
+        kind: "internal",
+        path: resolved,
+        source: specifier,
+      };
+    }
+  }
+
+  return {
+    kind: "external",
+    source: specifier,
+  };
+}
+
+export function attachCrossFileImpact(
+  fileTree: any[],
+  resolverConfig: ModuleResolverConfig = {},
+) {
+  const files: {
+    relPath: string;
+    imports: string[];
+    nodeRef: any;
+  }[] = [];
+
+  const collect = (nodes: any[]) => {
+    for (const node of nodes) {
+      if (!node) continue;
+
+      if (node.type === "file") {
+        const imports = Array.isArray(node.imports)
+          ? node.imports
+              .map((i: any) => (typeof i === "string" ? i : i?.name))
+              .filter(
+                (imp: unknown): imp is string =>
+                  typeof imp === "string" && imp.length > 0,
+              )
+          : [];
+
+        files.push({
+          relPath: node.fullPath,
+          imports,
+          nodeRef: node,
+        });
+      } else if (Array.isArray(node.children)) {
+        collect(node.children);
+      }
+    }
+  };
+
+  collect(fileTree);
+
+  const repoRoot = files.length ? files[0].relPath.split("/")[0] : "";
+
+  const fileLookup = new Map<string, string>();
+
+  for (const file of files) {
+    const normalizedPath = path.posix.normalize(file.relPath);
+
+    fileLookup.set(normalizedPath, file.relPath);
+
+    fileLookup.set(stripSourceExtension(normalizedPath), file.relPath);
+  }
+
+  const forwardMap: Record<string, ForwardImpact> = {};
+  const reverseMap: Record<string, string[]> = {};
+
+  for (const { relPath, imports } of files) {
+    const resolvedImports: string[] = [];
+    const brokenImports: { source: string }[] = [];
+
+    for (const specifier of imports) {
+      const resolution = resolveModule(
+        relPath,
+        specifier,
+        fileLookup,
+        repoRoot,
+        resolverConfig,
+      );
+
+      if (resolution.kind === "external") {
+        continue;
+      }
+
+      if (resolution.kind === "unresolved") {
+        brokenImports.push({
+          source: specifier,
+        });
+        continue;
+      }
+
+      const resolved = resolution.path;
+
+      if (!resolved || resolved === relPath) {
+        continue;
+      }
+
+      if (!resolvedImports.includes(resolved)) {
+        resolvedImports.push(resolved);
+      }
+
+      if (!reverseMap[resolved]) {
+        reverseMap[resolved] = [];
+      }
+
+      if (!reverseMap[resolved].includes(relPath)) {
+        reverseMap[resolved].push(relPath);
+      }
+    }
+
+    forwardMap[relPath] = {
+      imports: resolvedImports,
+      brokenImports,
+    };
+  }
+
+  for (const { relPath, nodeRef } of files) {
+    nodeRef.impact = {
+      imports: forwardMap[relPath]?.imports ?? [],
+      usedBy: reverseMap[relPath] ?? [],
+      brokenImports: forwardMap[relPath]?.brokenImports ?? [],
+    };
+  }
+
+  console.log(
+    `[impact] attached forward=${Object.keys(forwardMap).length}, reverse=${
+      Object.keys(reverseMap).length
+    }`,
+  );
+
+  return fileTree;
+}
+
+// fileDependecies
+
+export interface FileDependency {
+  id: string;
+  from: string;
+  to: string;
+  label: "imports" | "brokenImport";
+}
+
+export interface MissingDependencyNode {
+  id: string;
+  type: "missing";
+  name: string;
+  file: string;
+  meta: {
+    broken: true;
+  };
+}
+
+function normalizePath(p: string) {
+  return p.replace(/\\/g, "/");
+}
+
+export function collectFileDependencies(fileTree: any[]): {
+  dependencies: FileDependency[];
+  missingNodes: MissingDependencyNode[];
+} {
+  const dependencies: FileDependency[] = [];
+  const missingNodes: MissingDependencyNode[] = [];
+
+  const visitedDependencies = new Set<string>();
+  const visitedMissingNodes = new Set<string>();
+
+  const collect = (nodes: any[]) => {
+    for (const node of nodes) {
+      if (node.type === "file" && node.fullPath) {
+        const fromPath = normalizePath(node.fullPath);
+        const fromId = `file::${fromPath}`;
+
+        for (const resolvedPath of node.impact?.imports ?? []) {
+          const toPath = normalizePath(resolvedPath);
+          const toId = `file::${toPath}`;
+
+          const id = `dep::${fromId}->${toId}`;
+
+          if (!visitedDependencies.has(id)) {
+            dependencies.push({
+              id,
+              from: fromId,
+              to: toId,
+              label: "imports",
+            });
+
+            visitedDependencies.add(id);
+          }
+        }
+
+        for (const broken of node.impact?.brokenImports ?? []) {
+          const id = `missing::${fromPath}::${broken.source}`;
+          const edgeId = `broken::${fromId}->${id}`;
+
+          if (!visitedMissingNodes.has(id)) {
+            missingNodes.push({
+              id,
+              type: "missing",
+              name: broken.source,
+              file: fromPath,
+              meta: { broken: true },
+            });
+
+            visitedMissingNodes.add(id);
+          }
+
+          if (!visitedDependencies.has(edgeId)) {
+            dependencies.push({
+              id: edgeId,
+              from: fromId,
+              to: id,
+              label: "brokenImport",
+            });
+
+            visitedDependencies.add(edgeId);
+          }
+        }
+      }
+
+      if (node.children) {
+        collect(node.children);
+      }
+    }
+  };
+
+  collect(fileTree);
+
+  return { dependencies, missingNodes };
+}
+
+// fileGraphSummary
+
+import type { FlowGraph } from "./types";
+
+export interface FileGraphSummary {
+  file: string;
+  entryNodeIds: string[];
+  nodeCount: number;
+  edgeCount: number;
+}
+
+export function summarizeFileGraphs(
+  fileGraphs: Array<{
+    file: string;
+    graph: FlowGraph;
+  }>,
+): FileGraphSummary[] {
+  return fileGraphs.map(({ file, graph }) => {
+    const incoming = new Set<string>();
+
+    for (const edge of graph.edges) {
+      incoming.add(edge.to);
+    }
+
+    const entryNodeIds = graph.nodes
+      .filter((node) => !incoming.has(node.id))
+      .map((node) => node.id);
+
+    return {
+      file,
+      entryNodeIds,
+      nodeCount: graph.nodes.length,
+      edgeCount: graph.edges.length,
+    };
+  });
+}
+
+// enrichFileGraphSemantics
+
+import type { FlowEdge, FlowGraph, FlowNode } from "./types";
+import type { FileDependency } from "./fileDependecies";
+
+function detectLayer(filePath: string): string {
+  const p = filePath.toLowerCase();
+
+  if (p.includes("/controller")) return "controller";
+  if (p.includes("/route")) return "controller";
+  if (p.includes("/service")) return "service";
+  if (p.includes("/repository")) return "repository";
+  if (p.includes("/model")) return "model";
+  if (p.includes("/schema")) return "model";
+  if (p.includes("/util")) return "utility";
+  if (p.includes("/helper")) return "utility";
+  if (p.includes("/lib")) return "library";
+
+  return "module";
+}
+
+export type GraphDegree = {
+  inDegree: number;
+  outDegree: number;
+  totalDegree: number;
+};
+
+export type ProjectDegreeResult = {
+  maxDegree: number;
+  degrees: Map<string, GraphDegree>;
+};
+
+export type FileConnectivityMetrics = {
+  fileId: string;
+  filePath: string;
+  inDegree: number;
+  outDegree: number;
+  totalDegree: number;
+  score: number;
+};
+
+export function calculateProjectDegrees(
+  fileGraphs: Array<{
+    file: string;
+    graph: FlowGraph;
+  }>,
+): ProjectDegreeResult {
+  const degrees = new Map<string, GraphDegree>();
+
+  const ensureNode = (id: string) => {
+    if (!degrees.has(id)) {
+      degrees.set(id, {
+        inDegree: 0,
+        outDegree: 0,
+        totalDegree: 0,
+      });
+    }
+  };
+
+  const addEdge = (from: string, to: string) => {
+    ensureNode(from);
+    ensureNode(to);
+
+    const source = degrees.get(from)!;
+    const target = degrees.get(to)!;
+
+    source.outDegree += 1;
+    source.totalDegree += 1;
+
+    target.inDegree += 1;
+    target.totalDegree += 1;
+  };
+
+  for (const { graph } of fileGraphs) {
+    for (const node of graph.nodes) {
+      ensureNode(node.id);
+    }
+
+    for (const edge of graph.edges) {
+      addEdge(edge.from, edge.to);
+    }
+  }
+
+  let maxDegree = 0;
+
+  for (const degree of degrees.values()) {
+    if (degree.totalDegree > maxDegree) {
+      maxDegree = degree.totalDegree;
+    }
+  }
+
+  return {
+    maxDegree,
+    degrees,
+  };
+}
+
+export function calculateFileConnectivityMetrics(
+  dependencies: FileDependency[],
+  fileIds: Set<string>,
+): {
+  maxDegree: number;
+  metrics: FileConnectivityMetrics[];
+} {
+  const degrees = new Map<string, GraphDegree>();
+
+  const ensureFile = (id: string) => {
+    if (!fileIds.has(id)) return;
+
+    if (!degrees.has(id)) {
+      degrees.set(id, {
+        inDegree: 0,
+        outDegree: 0,
+        totalDegree: 0,
+      });
+    }
+  };
+
+  for (const fileId of fileIds) {
+    ensureFile(fileId);
+  }
+
+  for (const dependency of dependencies) {
+    if (dependency.label !== "imports") {
+      continue;
+    }
+
+    if (!fileIds.has(dependency.from) || !fileIds.has(dependency.to)) {
+      continue;
+    }
+
+    ensureFile(dependency.from);
+    ensureFile(dependency.to);
+
+    const source = degrees.get(dependency.from)!;
+    const target = degrees.get(dependency.to)!;
+
+    source.outDegree += 1;
+    source.totalDegree += 1;
+
+    target.inDegree += 1;
+    target.totalDegree += 1;
+  }
+
+  let maxDegree = 0;
+
+  for (const degree of degrees.values()) {
+    if (degree.totalDegree > maxDegree) {
+      maxDegree = degree.totalDegree;
+    }
+  }
+
+  const metrics = Array.from(fileIds).map((fileId) => {
+    const degree = degrees.get(fileId) ?? {
+      inDegree: 0,
+      outDegree: 0,
+      totalDegree: 0,
+    };
+
+    return {
+      fileId,
+      filePath: fileId.startsWith("file::")
+        ? fileId.slice("file::".length)
+        : fileId,
+      inDegree: degree.inDegree,
+      outDegree: degree.outDegree,
+      totalDegree: degree.totalDegree,
+      score: maxDegree > 0 ? degree.totalDegree / maxDegree : 0,
+    };
+  });
+
+  return {
+    maxDegree,
+    metrics,
+  };
+}
+
+function estimateComplexity(node: FlowNode): number {
+  if (!node.code) return 1;
+
+  const code = node.code;
+  let complexity = 1;
+
+  const matchesIf = (code.match(/\bif\b/g) || []).length;
+  const matchesFor = (code.match(/\bfor\b/g) || []).length;
+  const matchesWhile = (code.match(/\bwhile\b/g) || []).length;
+  const matchesSwitch = (code.match(/\bswitch\b/g) || []).length;
+  const matchesTry = (code.match(/\btry\b/g) || []).length;
+  const matchesReturn = (code.match(/\breturn\b/g) || []).length;
+
+  complexity +=
+    matchesIf * 1.5 +
+    matchesFor * 1.4 +
+    matchesWhile * 1.4 +
+    matchesSwitch * 2 +
+    matchesTry * 1.8 +
+    Math.min(matchesReturn, 3) * 0.5;
+
+  const nest = Math.max(
+    0,
+    (code.match(/{/g) || []).length - (code.match(/}/g) || []).length,
+  );
+
+  complexity += Math.max(0, Math.min(5, nest)) * 0.6;
+
+  return Math.max(1, Math.round(complexity));
+}
+
+export function enrichFileGraphSemantics(
+  graph: FlowGraph,
+  maxDegree: number,
+  projectDegrees: Map<string, GraphDegree>,
+  filePath?: string,
+  entryNodeIds: string[] = [],
+): FlowGraph {
+  const nodes = graph.nodes.map(
+    (node) =>
+      ({
+        ...node,
+        semantic: { ...(node.semantic || {}) },
+        meta: { ...(node.meta || {}) },
+      }) as FlowNode,
+  );
+
+  const edges = graph.edges.map((edge) => ({ ...edge }) as FlowEdge);
+
+  const resolvedFilePath = filePath || graph.meta?.file || "";
+
+  const fileMeta = {
+    ...(graph.meta || {}),
+    file: resolvedFilePath || graph.meta?.file,
+    layer: resolvedFilePath ? detectLayer(resolvedFilePath) : graph.meta?.layer,
+    entryNodeIds,
+  };
+
+  for (const node of nodes) {
+    const degree = projectDegrees.get(node.id) ?? {
+      inDegree: 0,
+      outDegree: 0,
+      totalDegree: 0,
+    };
+
+    const importance = maxDegree > 0 ? degree.totalDegree / maxDegree : 0;
+
+    node.semantic = {
+      ...(node.semantic || {}),
+      importance,
+      complexity: estimateComplexity(node),
+      connectivity: {
+        inDegree: degree.inDegree,
+        outDegree: degree.outDegree,
+        totalDegree: degree.totalDegree,
+        score: importance,
+      },
+    };
+  }
+
+  return {
+    nodes,
+    edges,
+    meta: fileMeta,
+  };
+}
+
+// distributedImpactEngine
+
+import { FileDependency } from "./fileDependecies";
+import type { FlowGraph } from "./types";
+
+export type DistributedFileGraph = {
+  file: string;
+  graph: FlowGraph;
+};
+
+export type DistributedIntelligenceInput = {
+  fileGraphs: DistributedFileGraph[];
+  fileIds: Set<string>;
+  entryFileIds: Set<string>;
+  candidateFileIds: Set<string>;
+  dependencies: FileDependency[];
+  apiCounts?: Map<string, number>;
+};
+
+export function findCircularFileDependencies(
+  dependencies: FileDependency[],
+  fileIds: Set<string>,
+): string[][] {
+  const adj = new Map<string, string[]>();
+
+  for (const edge of dependencies) {
+    if (edge.label !== "imports") continue;
+
+    if (!fileIds.has(edge.from) || !fileIds.has(edge.to)) {
+      continue;
+    }
+
+    if (!adj.has(edge.from)) {
+      adj.set(edge.from, []);
+    }
+
+    adj.get(edge.from)!.push(edge.to);
+  }
+
+  const visited = new Set<string>();
+  const stack = new Set<string>();
+  const cycles: string[][] = [];
+
+  function dfs(node: string, path: string[]) {
+    if (stack.has(node)) {
+      const cycleStartIndex = path.indexOf(node);
+
+      if (cycleStartIndex !== -1) {
+        cycles.push([...path.slice(cycleStartIndex), node]);
+      }
+
+      return;
+    }
+
+    if (visited.has(node)) {
+      return;
+    }
+
+    visited.add(node);
+    stack.add(node);
+
+    for (const next of adj.get(node) || []) {
+      dfs(next, [...path, next]);
+    }
+
+    stack.delete(node);
+  }
+
+  for (const node of adj.keys()) {
+    dfs(node, [node]);
+  }
+
+  return cycles;
+}
+
+export function findDeadFilesDistributed(input: {
+  fileIds: Set<string>;
+  entryFileIds: Set<string>;
+  candidateFileIds: Set<string>;
+  dependencies: FileDependency[];
+}): string[] {
+  const { fileIds, entryFileIds, candidateFileIds, dependencies } = input;
+
+  if (entryFileIds.size === 0) {
+    return [];
+  }
+
+  const importsFrom = new Map<string, string[]>();
+
+  for (const edge of dependencies) {
+    if (edge.label !== "imports") {
+      continue;
+    }
+
+    if (!fileIds.has(edge.from) || !fileIds.has(edge.to)) {
+      continue;
+    }
+
+    const existing = importsFrom.get(edge.from);
+
+    if (existing) {
+      existing.push(edge.to);
+    } else {
+      importsFrom.set(edge.from, [edge.to]);
+    }
+  }
+
+  const reachable = new Set<string>();
+  const queue: string[] = [];
+
+  for (const entryId of entryFileIds) {
+    if (!fileIds.has(entryId)) {
+      continue;
+    }
+
+    reachable.add(entryId);
+    queue.push(entryId);
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+
+    for (const next of importsFrom.get(current) ?? []) {
+      if (reachable.has(next)) {
+        continue;
+      }
+
+      reachable.add(next);
+      queue.push(next);
+    }
+  }
+
+  return Array.from(candidateFileIds).filter(
+    (fileId) => fileIds.has(fileId) && !reachable.has(fileId),
+  );
+}
+
+export function computeFileImportanceDistributed(input: {
+  fileIds: Set<string>;
+  dependencies: FileDependency[];
+  apiCounts?: Map<string, number>;
+}) {
+  const {
+    fileIds,
+    dependencies,
+    apiCounts = new Map<string, number>(),
+  } = input;
+
+  const importCounts = new Map<string, number>();
+
+  for (const edge of dependencies) {
+    if (edge.label !== "imports") {
+      continue;
+    }
+
+    if (!fileIds.has(edge.from) || !fileIds.has(edge.to)) {
+      continue;
+    }
+
+    importCounts.set(edge.to, (importCounts.get(edge.to) || 0) + 1);
+  }
+
+  const results: {
+    fileId: string;
+    score: number;
+  }[] = [];
+
+  for (const fileId of fileIds) {
+    const importScore = (importCounts.get(fileId) || 0) * 3;
+
+    const apiScore = (apiCounts.get(fileId) || 0) * 5;
+
+    results.push({
+      fileId,
+      score: importScore + apiScore,
+    });
+  }
+
+  return results.sort((a, b) => b.score - a.score);
+}
+
+// graphStore
+
+import clientPromise from "../../../../lib/mongoClient";
+import { FlowEdge, FlowNode, StoredFlowEdge } from "../analyzer/types";
+
+const FILE_GRAPH_COLLECTION = "file_graphs";
+
+export interface FileGraphRecord {
+  projectId: string;
+  ownerId?: string;
+  filePath: string;
+  nodes: any[];
+  edges: any[];
+  meta: {
+    nodeCount: number;
+    edgeCount: number;
+    mode: string | null;
+    generatedAt: Date;
+  };
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export async function ensureFileGraphIndexes() {
+  const client = await clientPromise;
+  const db = client.db();
+
+  const fileGraphs = db.collection(FILE_GRAPH_COLLECTION);
+
+  await fileGraphs.createIndex(
+    { projectId: 1, filePath: 1 },
+    {
+      unique: true,
+      name: "unique_project_file_graph",
+    },
+  );
+
+  await fileGraphs.createIndex(
+    { ownerId: 1, projectId: 1 },
+    {
+      name: "owner_project_file_graphs",
+    },
+  );
+}
+
+function compactEdgesForStorage(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): StoredFlowEdge[] {
+  const nodeIndexById = new Map<string, number>();
+
+  nodes.forEach((node, index) => {
+    nodeIndexById.set(node.id, index);
+  });
+
+  return edges.map(({ from, to, label }) => {
+    const fromIndex = nodeIndexById.get(from);
+    const toIndex = nodeIndexById.get(to);
+
+    if (fromIndex === undefined || toIndex === undefined) {
+      throw new Error(`Invalid file graph edge reference: ${from} -> ${to}`);
+    }
+
+    return {
+      from: fromIndex,
+      to: toIndex,
+      ...(label !== undefined ? { label } : {}),
+    };
+  });
+}
+
+function restoreEdgeIds(
+  edges: StoredFlowEdge[],
+  nodes: FlowNode[],
+): FlowEdge[] {
+  return edges.map((edge) => {
+    const fromNode = nodes[edge.from];
+    const toNode = nodes[edge.to];
+
+    if (!fromNode || !toNode) {
+      throw new Error(
+        `Invalid stored edge indexes: ${edge.from} -> ${edge.to}`,
+      );
+    }
+
+    return {
+      ...edge,
+      from: fromNode.id,
+      to: toNode.id,
+      id: `${fromNode.id}->${toNode.id}`,
+    };
+  });
+}
+
+export async function saveFileGraph(
+  projectId: string,
+  filePath: string,
+  graph: Pick<FileGraphRecord, "nodes" | "edges" | "meta">,
+  ownerId?: string,
+) {
+  const client = await clientPromise;
+  const db = client.db();
+  const col = db.collection(FILE_GRAPH_COLLECTION);
+
+  const now = new Date();
+
+  await col.updateOne(
+    { projectId, filePath },
+    {
+      $setOnInsert: {
+        projectId,
+        filePath,
+        createdAt: now,
+      },
+      $set: {
+        ownerId,
+        nodes: graph.nodes,
+        edges: compactEdgesForStorage(graph.nodes, graph.edges),
+        meta: graph.meta,
+        updatedAt: now,
+      },
+    },
+    { upsert: true },
+  );
+}
+
+export async function saveFileGraphs(
+  projectId: string,
+  graphs: Array<Pick<FileGraphRecord, "filePath" | "nodes" | "edges" | "meta">>,
+  ownerId?: string,
+) {
+  if (graphs.length === 0) return;
+
+  const client = await clientPromise;
+  const db = client.db();
+  const col = db.collection(FILE_GRAPH_COLLECTION);
+  const now = new Date();
+
+  const operations = graphs.map((graph) => ({
+    updateOne: {
+      filter: {
+        projectId,
+        filePath: graph.filePath,
+      },
+      update: {
+        $setOnInsert: {
+          projectId,
+          filePath: graph.filePath,
+          createdAt: now,
+        },
+        $set: {
+          ownerId,
+          nodes: graph.nodes,
+          edges: compactEdgesForStorage(graph.nodes, graph.edges),
+          meta: graph.meta,
+          updatedAt: now,
+        },
+      },
+      upsert: true,
+    },
+  }));
+
+  await col.bulkWrite(operations, { ordered: false });
+}
+
+export async function getFileGraph(
+  projectId: string,
+  filePath: string,
+  ownerId?: string,
+) {
+  const client = await clientPromise;
+  const db = client.db();
+
+  const filter: Record<string, any> = { projectId, filePath };
+
+  if (ownerId) {
+    filter.ownerId = ownerId;
+  }
+
+  const doc = await db.collection(FILE_GRAPH_COLLECTION).findOne(filter);
+
+  if (!doc) {
+    return null;
+  }
+
+  return {
+    ...doc,
+    edges: restoreEdgeIds(doc.edges ?? [], doc.nodes ?? []),
+  };
+}
+
+export async function getFileGraphs(projectId: string, ownerId?: string) {
+  const client = await clientPromise;
+  const db = client.db();
+
+  const filter: Record<string, any> = { projectId };
+
+  if (ownerId) {
+    filter.ownerId = ownerId;
+  }
+
+  const docs = await db
+    .collection(FILE_GRAPH_COLLECTION)
+    .find(filter)
+    .sort({ filePath: 1 })
+    .toArray();
+
+  return docs.map((doc) => ({
+    ...doc,
+    edges: restoreEdgeIds(doc.edges ?? [], doc.nodes ?? []),
+  }));
+}
+
+export async function deleteFileGraphs(projectId: string, ownerId?: string) {
+  const client = await clientPromise;
+  const db = client.db();
+
+  const filter: Record<string, any> = { projectId };
+
+  if (ownerId) {
+    filter.ownerId = ownerId;
+  }
+
+  return db.collection(FILE_GRAPH_COLLECTION).deleteMany(filter);
+}
+
+export async function deleteStaleFileGraphs(
+  projectId: string,
+  activeFilePaths: string[],
+  ownerId?: string,
+) {
+  const client = await clientPromise;
+  const db = client.db();
+
+  const filter: Record<string, any> = {
+    projectId,
+    filePath: { $nin: activeFilePaths },
+  };
+
+  if (ownerId) {
+    filter.ownerId = ownerId;
+  }
+
+  return db.collection(FILE_GRAPH_COLLECTION).deleteMany(filter);
+}
+
+// types
+
+export type FlowNodeSemantic = {
+  complexity?: number;
+  importance?: number;
+  dead?: boolean;
+
+  connectivity?: {
+    inDegree: number;
+    outDegree: number;
+    totalDegree: number;
+    score: number;
+  };
+
+  structure?: {
+    importCount: number;
+    exportCount: number;
+    functionCount: number;
+    classCount: number;
+    componentCount: number;
+    apiCount: number;
+    schemaCount: number;
+    blockCount: number;
+  };
+};
+
+export type FlowNode = {
+  id: string;
+  type: string;
+  name?: string;
+  file?: string;
+  line?: number;
+  code?: string;
+  semantic?: FlowNodeSemantic;
+  meta?: Record<string, any>;
+};
+
+export type StoredFlowEdge = {
+  from: number;
+  to: number;
+  label?: string;
+};
+
+export type FlowEdge = {
+  id: string;
+  from: string;
+  to: string;
+  label?: string;
+};
+
+export type FileConnectivityMetrics = {
+  fileId: string;
+  filePath: string;
+  inDegree: number;
+  outDegree: number;
+  totalDegree: number;
+  score: number;
+};
+
+export type DependencyIntelligence = {
+  deadFiles: string[];
+  circularDependencies: string[][];
+  importanceRanking: {
+    fileId: string;
+    score: number;
+  }[];
+};
+
+export type DependencyAnalysisStats = {
+  fileCount: number;
+  executionNodeCount: number;
+  executionEdgeCount: number;
+  dependencyCount: number;
+  missingDependencyCount: number;
+};
+
+export type ProjectDependencyAnalysis = {
+  version: number;
+  generatedAt: Date;
+
+  stats: DependencyAnalysisStats;
+  fileMetrics: FileConnectivityMetrics[];
+
+  intelligence: DependencyIntelligence;
+};
+
+export type FlowGraphMeta = {
+  file?: string;
+
+  layer?: string;
+
+  entryNodeIds?: string[];
+
+  projectId?: string;
+
+  nodeCount?: number;
+  edgeCount?: number;
+
+  mode?: "execution" | string | null;
+
+  generatedAt?: Date;
+};
+
+export type FlowGraph = {
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  meta?: FlowGraphMeta;
+};
+
+--------------------------- complete frontebd graph flow ---------------------------
+
+// page.tsx
+
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { getAuth } from "firebase/auth";
+import { toast } from "sonner";
+import ProjectHeader from "../components/ProjectHeader";
+import ProjectFilesPanel from "../components/ProjectFilesPanel";
+import ProjectOverview from "../components/ProjectOverview";
+import FileViewerPanel from "../components/FileViewerPanel";
+import { generateSummary } from "../utils/markdown";
+import {
+  filterFileTree,
+  findReadmePath,
+  findSelectedFileNode,
+} from "../utils/fileTree";
+import { useProjectPolling } from "@/hooks/useProjectPolling";
+import { useProjectData } from "@/hooks/useProjectData";
+import { useFileHandler } from "@/hooks/useFileHandler";
+import { getLanguage } from "../utils/language";
+import ProjectWorkspaceTabs from "../components/ProjectWorkspaceTabs";
+import {
+  FlowGraph,
+  ProjectDependencyAnalysis,
+} from "@/app/api/lib/analyzer/types";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Trash2 } from "lucide-react";
+
+export default function ProjectDetailPage() {
+  const router = useRouter();
+  const { id: projectId } = useParams() as { id: string };
+
+  const { project, setProject, isLoaded } = useProjectData(projectId);
+  const { selectedPath, setSelectedPath, fileContent, handleFileClick } =
+    useFileHandler(project?.projectId);
+  const [readmeContent, setReadmeContent] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [tagInput, setTagInput] = useState("");
+  const [tags, setTags] = useState<string[] | []>([]);
+  const [insights, setInsights] = useState<any>(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [graphData, setGraphData] = useState<FlowGraph>({
+    nodes: [],
+    edges: [],
+  });
+  const [readmeSummary, setReadmeSummary] = useState("");
+  const [line, setLine] = useState<number | null>(null);
+  const { jobStatus, jobProgress, jobMessage, graphReady } = useProjectPolling(
+    project?.projectId,
+  );
+  const [activeView, setActiveView] = useState<"overview" | "explorer">(
+    "overview",
+  );
+
+  useEffect(() => {
+    if (!graphReady || !projectId) return;
+
+    const refreshProject = async () => {
+      try {
+        const token = await getAuth().currentUser?.getIdToken();
+
+        const res = await fetch(`/api/project?id=${projectId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!res.ok) return;
+
+        const updatedProject = await res.json();
+
+        setProject(updatedProject);
+      } catch (err) {
+        console.error("Failed to refresh project:", err);
+      }
+    };
+
+    refreshProject();
+  }, [graphReady, projectId, setProject]);
+
+  useEffect(() => {
+    if (project?.projectName) {
+      setNewName(project.projectName);
+    }
+
+    console.log(project);
+  }, [project]);
+
+  useEffect(() => {
+    if (!graphReady || !isLoaded || !project) {
+      return;
+    }
+
+    const getReadMeData = async () => {
+      let readmePath;
+      if (isLoaded) {
+        readmePath = findReadmePath(project.fileTree);
+        setTags(project.tags);
+        setInsights(project.insights);
+      }
+
+      if (readmePath) {
+        const contentRes = await fetch(
+          `/api/project/file?projectId=${
+            project?.projectId
+          }&filePath=${encodeURIComponent(readmePath)}`,
+        );
+        const contentData = await contentRes.json();
+
+        const content = contentData.content;
+        setReadmeContent(content);
+        setReadmeSummary(generateSummary(content));
+      }
+    };
+    getReadMeData();
+  }, [graphReady, isLoaded, project]);
+
+  const dependencyAnalysis = project?.dependencyAnalysis as
+    | ProjectDependencyAnalysis
+    | undefined;
+
+  const handleDelete = async () => {
+    const token = await getAuth().currentUser?.getIdToken();
+    const res = await fetch(`/api/project?id=${projectId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (res.ok) {
+      toast.success("Project deleted successfully");
+      router.push("/projects");
+    } else {
+      toast.error("Failed to delete project");
+    }
+  };
+
+  const handleRename = async () => {
+    setEditingName(false);
+    if (!newName || newName === project.projectName) return;
+
+    const token = await getAuth().currentUser?.getIdToken();
+    const res = await fetch("/api/project", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ id: project._id, newName }),
+    });
+
+    if (res.ok) {
+      setProject({ ...project, projectName: newName });
+      toast.success("Project renamed!");
+    }
+  };
+
+  const selectedFileNode = useMemo(() => {
+    if (isLoaded && selectedPath)
+      return findSelectedFileNode(project.fileTree, selectedPath);
+  }, [isLoaded, selectedPath, project]);
+
+  if (!project) {
+    return (
+      <div className="p-6 space-y-4">
+        <div className="h-6 w-48 bg-muted animate-pulse rounded" />
+        <div className="h-5 w-32 bg-muted animate-pulse rounded" />
+      </div>
+    );
+  }
+
+  if (jobStatus === "error") {
+    return (
+      <div className="flex flex-col items-center justify-center h-[70vh] text-red-600">
+        <p className="text-lg font-semibold">
+          Analysis Failed Something went wrong while analysing your repository.
+          Please try uploading repository again.
+        </p>
+        <p className="text-sm">{jobMessage}</p>
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button
+              variant="outline"
+              className="w-36 hover:bg-red-600 hover:text-white"
+            >
+              <Trash2 size={14} className="mr-2" />
+              Delete Project
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete Project</AlertDialogTitle>
+              <AlertDialogDescription>Analysis failed.</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-red-600 text-white hover:bg-red-700"
+                onClick={handleDelete}
+              >
+                Confirm
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    );
+  }
+
+  if (!project.analysisComplete) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[70vh] space-y-6">
+        <div className="text-center">
+          <h2 className="text-xl font-semibold">Analyzing your repository</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            {jobMessage || "This may take a few seconds..."}
+          </p>
+        </div>
+
+        <div className="w-96 bg-gray-300 rounded-full h-2 overflow-hidden">
+          <div
+            className="bg-blue-600 h-2 transition-all duration-500 ease-out"
+            style={{ width: `${jobProgress}%` }}
+          />
+        </div>
+
+        <div className="text-sm text-muted-foreground">
+          {jobProgress}% complete
+        </div>
+
+        <div className="flex space-x-1">
+          <div className="w-2 h-2 bg-primary rounded-full animate-bounce" />
+          <div className="w-2 h-2 bg-primary rounded-full animate-bounce delay-150" />
+          <div className="w-2 h-2 bg-primary rounded-full animate-bounce delay-300" />
+        </div>
+      </div>
+    );
+  }
+
+  const filteredTree = project?.fileTree
+    ? filterFileTree(project.fileTree, searchTerm)
+    : [];
+
+  return (
+    <div className="min-h-screen space-y-6 px-4 py-5 sm:p-6">
+      <ProjectHeader
+        projectName={project.projectName}
+        projectId={projectId}
+        editingName={editingName}
+        newName={newName}
+        setNewName={setNewName}
+        setEditingName={setEditingName}
+        handleRename={handleRename}
+        tags={tags}
+        tagInput={tagInput}
+        setTagInput={setTagInput}
+        setTags={setTags}
+        handleDelete={handleDelete}
+      />
+
+      <ProjectWorkspaceTabs
+        activeView={activeView}
+        setActiveView={setActiveView}
+      />
+
+      {activeView === "overview" && (
+        <div className="space-y-6">
+          <div className="col-span-12 lg:col-span-4">
+            <ProjectOverview
+              summary={readmeSummary}
+              insights={insights}
+              packageInfo={project?.packageInfo}
+              getLanguageMeta={getLanguage}
+            />
+          </div>
+        </div>
+      )}
+
+      {activeView === "explorer" && (
+        <div className="grid grid-cols-12 gap-6 items-stretch min-h-[900px]">
+          <div className="col-span-12 xl:col-span-5 flex min-w-0">
+            <ProjectFilesPanel
+              project={project}
+              setLine={setLine}
+              handleFileClick={handleFileClick}
+              fileTree={filteredTree}
+              setSelectedPath={setSelectedPath}
+              searchTerm={searchTerm}
+              setSearchTerm={setSearchTerm}
+              entryPoints={project?.entryPoints || []}
+              selectedPath={selectedPath}
+            />
+          </div>
+
+          <div className="col-span-12 xl:col-span-7 flex min-w-0">
+            <FileViewerPanel
+              id={project.projectId}
+              projectId={project._id}
+              project={project}
+              graphData={graphData}
+              setGraphData={setGraphData}
+              selectedPath={selectedPath}
+              setSelectedPath={setSelectedPath}
+              fileContent={fileContent}
+              lineNumber={line}
+              selectedFileNode={selectedFileNode}
+              dependencyAnalysis={dependencyAnalysis}
+              readmeContent={readmeContent}
+              readmeSummary={readmeSummary}
+              getLanguageMeta={getLanguage}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// useProjectData
+
+import { useEffect, useState } from "react";
+import { getAuth } from "firebase/auth";
+import { useProject } from "@/context/ProjectContext";
+
+export function useProjectData(projectId: string) {
+  const { project, setProject } = useProject();
+  const [isLoaded, setIsLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!projectId) return;
+
+    const loadProject = async () => {
+      try {
+        const token = await getAuth().currentUser?.getIdToken();
+
+        const res = await fetch(`/api/project?id=${projectId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        const data = await res.json();
+
+        if (data) {
+          setProject(data);
+          setIsLoaded(true);
+        }
+      } catch (err) {
+        console.error("Failed to load project", err);
+      }
+    };
+
+    loadProject();
+  }, [projectId]);
+
+  return {
+    project,
+    setProject,
+    isLoaded,
+  };
+}
+
+// useFileHandler
+
+import { useState } from "react";
+import { getAuth } from "firebase/auth";
+
+export function useFileHandler(projectId: string) {
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [fileContent, setFileContent] = useState("");
+
+  const handleFileClick = async (path: string) => {
+    setSelectedPath(path);
+
+    if (!path.split("\\").pop()?.includes(".")) return;
+
+    try {
+      setFileContent("Loading file content...");
+
+      const token = await getAuth().currentUser?.getIdToken();
+      const res = await fetch(
+        `/api/projects/${projectId}/file-content?path=${encodeURIComponent(path)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      const data = await res.json();
+
+      setFileContent(data.content || "Unable to load file.");
+    } catch (err) {
+      console.error("File load error", err);
+      setFileContent("Error loading file.");
+    }
+  };
+
+  return {
+    selectedPath,
+    setSelectedPath,
+    fileContent,
+    setFileContent,
+    handleFileClick,
+  };
+}
+
+// useFileHandler
+
+import { useEffect, useState } from "react";
+import { getAuth } from "firebase/auth";
+
+export function useProjectPolling(projectId: string) {
+  const [jobStatus, setJobStatus] = useState<
+    "idle" | "running" | "done" | "error"
+  >("idle");
+  const [jobProgress, setJobProgress] = useState(0);
+  const [jobMessage, setJobMessage] = useState("");
+  const [graphReady, setGraphReady] = useState(false);
+
+  useEffect(() => {
+    if (!projectId) {
+      return;
+    }
+
+    const pollJob = async () => {
+      const token = await getAuth().currentUser?.getIdToken();
+      if (!token) return false;
+
+      try {
+        const res = await fetch(
+          `/api/projects/${projectId}/latest-job?token=${encodeURIComponent(token)}`,
+        );
+
+        if (!res.ok) return false;
+
+        const job = await res.json();
+
+        if (!job) {
+          setJobStatus("done");
+          setGraphReady(true);
+          return true;
+        }
+
+        setJobStatus(job.status);
+        setJobProgress(job.progress || 0);
+        setJobMessage(job.message || "Analysing repository...");
+
+        if (job.status === "done") {
+          setGraphReady(true);
+          return true;
+        }
+
+        if (job.status === "error") {
+          return true;
+        }
+      } catch (err) {
+        console.error("Polling error", err);
+      }
+
+      return false;
+    };
+
+    (async () => {
+      await pollJob();
+    })();
+
+    const interval = setInterval(async () => {
+      const done = await pollJob();
+      if (done) clearInterval(interval);
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [projectId]);
+
+  return {
+    jobStatus,
+    jobProgress,
+    jobMessage,
+    graphReady,
+  };
+}
+
+// ProjectFilesPanel
+
+"use client";
+
+import React, { useCallback, useMemo, useState } from "react";
+import { FolderSearch, FolderInput } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { BreadcrumbNavigator } from "./Breadcrumbs";
+import { useDebouncedCallback } from "use-debounce";
+import dynamic from "next/dynamic";
+
+const GlobalSearch = dynamic(() => import("./GlobalSearch"), {
+  ssr: false,
+  loading: () => (
+    <div className="h-10 w-full rounded-md border bg-muted animate-pulse" />
+  ),
+});
+
+const ProjectTree = dynamic(() => import("@/components/ProjectTree"), {
+  ssr: false,
+  loading: () => (
+    <div className="space-y-2">
+      <div className="h-4 w-40 rounded bg-muted animate-pulse" />
+      <div className="h-4 w-52 rounded bg-muted" />
+      <div className="h-4 w-32 rounded bg-muted" />
+    </div>
+  ),
+});
+
+interface ProjectFilesPanelProps {
+  project: any;
+  searchTerm: string;
+  fileTree: any;
+  handleFileClick: (path: string) => void;
+  setSelectedPath: React.Dispatch<React.SetStateAction<string | null>>;
+  setLine: React.Dispatch<React.SetStateAction<number | null>>;
+  setSearchTerm: (value: string) => void;
+  entryPoints: string[];
+  selectedPath?: string | null;
+}
+
+export default function ProjectFilesPanel({
+  project,
+  searchTerm,
+  handleFileClick,
+  fileTree,
+  setSearchTerm,
+  setLine,
+  entryPoints,
+  selectedPath,
+}: ProjectFilesPanelProps) {
+  const [localSearch, setLocalSearch] = useState(searchTerm);
+
+  const resolvedTree = useMemo(
+    () => fileTree || project.fileTree,
+    [fileTree, project.fileTree],
+  );
+
+  const debouncedSearch = useDebouncedCallback((value: string) => {
+    setSearchTerm(value);
+  }, 250);
+
+  const handleBreadcrumbClick = useCallback(
+    (path: string) => handleFileClick(path),
+    [handleFileClick],
+  );
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden rounded-2xl border bg-card p-4 shadow-sm sm:p-6">
+      <div className="sticky top-0 z-10 -mx-4 mb-5 flex shrink-0 items-center gap-2 border-b bg-card px-4 pb-4 sm:-mx-6 sm:px-6">
+        <FolderSearch className="h-4 w-4 shrink-0 text-primary" />
+
+        <span className="text-sm font-semibold text-foreground">
+          Project Files
+        </span>
+      </div>
+
+      <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto pr-1 sm:gap-6">
+        <Input
+          type="text"
+          placeholder="Search files by name..."
+          value={localSearch}
+          onChange={(e) => {
+            const value = e.target.value;
+
+            setLocalSearch(value);
+            debouncedSearch(value);
+          }}
+          className="h-10 w-full"
+        />
+
+        {entryPoints?.length > 0 && (
+          <div className="min-w-0 space-y-3">
+            <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+              <FolderInput className="h-4 w-4 shrink-0 text-primary" />
+
+              <span className="truncate">Likely Entrypoints</span>
+
+              <span className="shrink-0 text-xs font-normal text-muted-foreground">
+                ({entryPoints.length})
+              </span>
+            </div>
+
+            <div className="flex max-h-40 flex-wrap gap-2 overflow-y-auto pr-1 sm:max-h-48">
+              {entryPoints.map((entry: any, i: number) => {
+                const path = entry.path || entry;
+
+                return (
+                  <Badge
+                    key={`${path}-${i}`}
+                    variant="outline"
+                    className="
+                      flex
+                      min-w-0
+                      max-w-full
+                      cursor-pointer
+                      items-center
+                      gap-2
+                      bg-muted/50
+                      px-3
+                      py-1
+                      text-xs
+                      font-medium
+                      text-muted-foreground
+                      transition-colors
+                      hover:bg-accent
+                    "
+                    onClick={() => handleFileClick(path)}
+                  >
+                    <span
+                      className="
+                        min-w-0
+                        max-w-[calc(100vw-9rem)]
+                        truncate
+                        sm:max-w-[180px]
+                      "
+                      title={path}
+                    >
+                      {path}
+                    </span>
+
+                    {entry.score != null && (
+                      <span className="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
+                        {entry.score}%
+                      </span>
+                    )}
+                  </Badge>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {selectedPath && (
+          <div className="min-w-0 overflow-hidden">
+            <BreadcrumbNavigator
+              fileTree={resolvedTree}
+              selectedPath={selectedPath}
+              onFileClick={handleBreadcrumbClick}
+            />
+          </div>
+        )}
+
+        <div className="min-w-0">
+          <GlobalSearch
+            projectId={project.projectId}
+            setLine={setLine}
+            handleFileClick={handleFileClick}
+          />
+        </div>
+
+        <div className="min-w-0">
+          <ProjectTree
+            fileTree={resolvedTree}
+            onFileClick={handleFileClick}
+            selectedPath={selectedPath}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// FileViewerPanel
+
+"use client";
+
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useMemo,
+} from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  Download,
+  ExternalLink,
+  Code2,
+  MoreVertical,
+  Clipboard,
+  FileText,
+  BookText,
+} from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import { toast } from "sonner";
+import { ObjectId } from "bson";
+import { getAuth } from "firebase/auth";
+import {
+  FlowGraph,
+  ProjectDependencyAnalysis,
+} from "@/app/api/lib/analyzer/types";
+import FlowVisualizer from "./FlowVisualizer";
+import FileInsightsSidebar from "./FileInsightsSidebar";
+import CodeEditorPanel from "./CodeEditorPanel";
+
+interface FileViewerPanelProps {
+  id: any;
+  projectId: number | ObjectId;
+  project: JSON | any;
+
+  graphData: FlowGraph;
+  setGraphData: any;
+  dependencyAnalysis?: ProjectDependencyAnalysis;
+
+  selectedPath: string | null;
+  setSelectedPath: (filePath: string | null) => string | void;
+
+  fileContent: string;
+  selectedFileNode: any;
+
+  lineNumber: number | null;
+
+  readmeContent: string | null;
+  readmeSummary: string | null;
+
+  getLanguageMeta: (filePath: string) => {
+    name: string;
+    color: string;
+  };
+}
+
+export default function FileViewerPanel({
+  id,
+  projectId,
+  project,
+  graphData,
+  setGraphData,
+  selectedPath,
+  setSelectedPath,
+  fileContent,
+  selectedFileNode,
+  dependencyAnalysis,
+  lineNumber,
+  readmeContent,
+  readmeSummary,
+  getLanguageMeta,
+}: FileViewerPanelProps) {
+  const { targetLineNumber, setTargetLineNumber } = useAuth();
+  const [viewMode, setViewMode] = useState<"code" | "graph">("code");
+  const [searchTerm, setSearchTerm] = useState<any>("");
+  const codeContainerRef = useRef<HTMLDivElement | null>(null);
+  const [lastScrolledLine, setLastScrolledLine] = useState<number | null>(null);
+  const [showRawData, setShowRawData] = useState(false);
+  const [hoveredLine, setHoveredLine] = useState<number | null>(null);
+  const [hoveredLinePos, setHoveredLinePos] = useState<number | null>(null);
+  const [openCommentDialog, setOpenCommentDialog] = useState<{
+    open: boolean;
+    line: number | null;
+  }>({
+    open: false,
+    line: null,
+  });
+  const [comments, setComments] = useState<Record<number, string[]> | null>();
+  const [commentText, setCommentText] = useState("");
+  const [innerScrollLeft, setInnerScrollLeft] = useState(0);
+  const innerPreRef = useRef<HTMLElement | null>(null);
+  const [foldedRanges, setFoldedRanges] = useState<Set<string>>(new Set());
+  const [foldPositions, setFoldPositions] = useState<
+    Record<string, { toggleTop: number; placeholderTop: number }>
+  >({});
+  const [showDocs, setShowDocs] = useState(false);
+
+  const lineCount = useMemo(
+    () => fileContent.split("\n").length ?? 0,
+    [fileContent],
+  );
+
+  useEffect(() => {
+    console.log(selectedFileNode);
+  }, [selectedFileNode]);
+
+  const isLargeFile = lineCount > 1000;
+
+  useEffect(() => {
+    const pre = codeContainerRef.current?.querySelector("pre");
+    if (pre) {
+      innerPreRef.current = pre as HTMLElement;
+
+      const handleScroll = () => {
+        setInnerScrollLeft(pre.scrollLeft);
+        setHoveredLine(null);
+        setHoveredLinePos(null);
+      };
+
+      pre.addEventListener("scroll", handleScroll, { passive: true });
+      handleScroll();
+
+      return () => {
+        pre.removeEventListener("scroll", handleScroll);
+      };
+    }
+  }, [fileContent]);
+
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      const container = codeContainerRef.current;
+
+      if (!container) return;
+
+      const target = e.target as Node;
+
+      if (!container.contains(target)) {
+        setHoveredLine(null);
+        setHoveredLinePos(null);
+      }
+    };
+
+    document.addEventListener("mousemove", handleGlobalMouseMove);
+
+    return () => {
+      document.removeEventListener("mousemove", handleGlobalMouseMove);
+    };
+  }, []);
+
+  const foldBlocks = useMemo(() => {
+    if (!selectedFileNode) return [];
+    const candidates: any[] = [];
+
+    [
+      "functions",
+      "classes",
+      "components",
+      "exports",
+      "blocks",
+      "apis",
+      "schemas",
+    ].forEach((k) => {
+      const arr = selectedFileNode[k] || [];
+      arr.forEach((it: any) => {
+        const start = it.start ?? it.loc ?? null;
+        const end = it.end ?? null;
+        if (
+          typeof start === "number" &&
+          typeof end === "number" &&
+          end > start
+        ) {
+          candidates.push({
+            name: it.name,
+            start,
+            end,
+            kind: k,
+          });
+        }
+      });
+    });
+
+    const map = new Map<string, any>();
+    candidates
+      .sort((a, b) => a.start - b.start || a.end - b.end)
+      .forEach((c) => {
+        if (c.end <= c.start) return;
+
+        const existing = Array.from(map.values()).find(
+          (b) =>
+            (b.start == c.start && b.end === c.end) ||
+            (b.end === c.end && b.start < c.start),
+        );
+
+        if (!existing) {
+          map.set(`${c.start}-${c.end}`, c);
+        }
+      });
+
+    return Array.from(map.values()).sort((a, b) => a.start - b.start);
+  }, [selectedFileNode]);
+
+  useLayoutEffect(() => {
+    const container = codeContainerRef.current;
+    if (!container) return;
+    if (isLargeFile) return;
+
+    const next: Record<string, { toggleTop: number; placeholderTop: number }> =
+      {};
+
+    foldBlocks.forEach((block) => {
+      const el = container.querySelector(
+        `[data-line-number="${block.start}"]`,
+      ) as HTMLElement | null;
+      if (!el) return;
+      const toggleTop =
+        el.offsetTop + Math.max(2, Math.round(el.offsetHeight / 6));
+      const placeholderTop = el.offsetTop + el.offsetHeight;
+      next[`${block.start}-${block.end}`] = { toggleTop, placeholderTop };
+    });
+
+    setFoldPositions(next);
+  }, [
+    foldBlocks,
+    comments,
+    fileContent,
+    showRawData,
+    foldedRanges,
+    selectedPath,
+  ]);
+
+  useEffect(() => {
+    const getComment = async () => {
+      try {
+        const token = await getAuth().currentUser?.getIdToken();
+
+        const res = await fetch(
+          `/api/comments?projectId=${projectId}&filePath=${selectedPath}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          },
+        );
+
+        const data = await res.json();
+        const grouped: { [line: number]: string[] } = {};
+        data.forEach((c: any) => {
+          if (!grouped[c.lineNumber]) grouped[c.lineNumber] = [];
+          grouped[c.lineNumber].push(c.text);
+        });
+
+        setComments(grouped);
+      } catch (error) {
+        console.log("Error fetching comments : ", error);
+      }
+    };
+
+    getComment();
+  }, [selectedPath]);
+
+  useEffect(() => {
+    setSearchTerm("");
+    setLastScrolledLine(null);
+  }, [selectedPath]);
+
+  const addComment = async () => {
+    if (!openCommentDialog.line) return;
+    await fetch("/api/comments", {
+      method: "POST",
+      body: JSON.stringify({
+        projectId,
+        filePath: selectedPath,
+        lineNumber: openCommentDialog.line,
+        text: commentText,
+      }),
+    });
+
+    setComments((prev) => {
+      const copy = { ...(prev ?? {}) };
+      const ln = openCommentDialog.line!;
+      copy[ln] = copy[ln] ? [...copy[ln], commentText] : [commentText];
+      return copy;
+    });
+
+    setCommentText("");
+    setOpenCommentDialog({ open: false, line: null });
+  };
+
+  const downloadFile = () => {
+    const blob = new Blob([fileContent], { type: "text/plain; charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = selectedPath?.split("/").pop() || "file.txt";
+    a.click();
+    window.URL.revokeObjectURL(url);
+  };
+
+  const debounce = (fn: Function, delay: number) => {
+    let timer: ReturnType<typeof setTimeout>;
+    return (...args: any[]) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), delay);
+    };
+  };
+
+  const debouncedScroll = debounce((line: number) => {
+    jumpToLine(line);
+  }, 200);
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const term = e.target.value;
+    setSearchTerm(term);
+
+    if (!term.trim()) {
+      setTargetLineNumber(null);
+      setLastScrolledLine(null);
+      return;
+    }
+
+    const lines = fileContent.split("\n");
+    const matchIndex = lines.findIndex((line) =>
+      line.toLowerCase().includes(term.toLowerCase()),
+    );
+
+    if (matchIndex !== -1) {
+      const newLine = matchIndex + 1;
+      setTargetLineNumber(newLine);
+
+      if (newLine !== lastScrolledLine) {
+        setLastScrolledLine(newLine);
+        debouncedScroll(newLine);
+      }
+    } else {
+      setTargetLineNumber(null);
+      setLastScrolledLine(null);
+    }
+  };
+
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const jumpToLine = (lineNumber: number) => {
+    setTargetLineNumber(lineNumber);
+
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+    }
+
+    const lineElement = codeContainerRef.current?.querySelector(
+      `[data-line-number="${lineNumber}"]`,
+    );
+
+    if (lineElement) {
+      (lineElement as HTMLElement).scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+
+    timeoutRef.current = setTimeout(() => {
+      setTargetLineNumber(null);
+    }, 1500);
+  };
+
+  const handleMouseEnterLine = (lineNumber: number, top: number) => {
+    setHoveredLine((prev) => (prev === lineNumber ? prev : lineNumber));
+    setHoveredLinePos(top);
+  };
+
+  useEffect(() => {
+    if (lineNumber) {
+      jumpToLine(lineNumber);
+    }
+  }, [fileContent, lineNumber]);
+
+  const toggleFold = (key: string) => {
+    setFoldedRanges((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const isLineHidden = (ln: number) => {
+    for (const key of foldedRanges) {
+      const [sStr, eStr] = key.split("-");
+      const s = Number(sStr);
+      const e = Number(eStr);
+      if (ln > s && ln < e) return true;
+    }
+    return false;
+  };
+
+  const downloadRawFile = async () => {
+    const token = await getAuth().currentUser?.getIdToken();
+
+    const res = await fetch(
+      `/api/project/file/raw?projectId=${project.projectId}&filePath=${encodeURIComponent(selectedPath!)}&token=${encodeURIComponent(token!)}`,
+    );
+
+    const blob = await res.blob();
+
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = selectedPath!.split("/").pop() ?? "file";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <>
+      <div className="bg-card border rounded-2xl h-full w-full min-h-0 p-4 shadow-sm space-y-4">
+        <div className="flex gap-2 bg-muted p-1 rounded-lg w-fit">
+          <button
+            type="button"
+            onClick={() => setViewMode("code")}
+            className={`px-3 py-1 text-sm rounded-md transition ${
+              viewMode === "code"
+                ? "bg-background shadow-sm font-medium"
+                : "text-muted-foreground"
+            }`}
+          >
+            Code
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("graph")}
+            className={`px-3 py-1 text-sm rounded-md transition ${
+              viewMode === "graph"
+                ? "bg-background shadow-sm font-medium"
+                : "text-muted-foreground"
+            }`}
+          >
+            Graph
+          </button>
+        </div>
+
+        <div className="h-[650px] min-h-0 sm:h-[700px] lg:h-[750px]">
+          {viewMode === "code" ? (
+            selectedPath ? (
+              <div className="grid h-full min-h-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
+                <div className="flex flex-col min-w-0 min-h-0 h-full">
+                  <div className="sticky top-0 z-10 flex min-w-0 items-center gap-2 border-b bg-card pb-3 mb-3 sm:gap-3">
+                    <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+                      <FileText className="w-4 h-4 text-primary shrink-0" />
+                      <span className="font-mono text-sm font-medium truncate block w-full">
+                        {selectedPath}
+                      </span>
+                    </div>
+
+                    <div className="shrink-0">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                            aria-label="File actions"
+                          >
+                            <MoreVertical size={16} />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          className="w-44 bg-white"
+                        >
+                          <DropdownMenuItem
+                            onClick={downloadFile}
+                            className="gap-2 cursor-pointer"
+                          >
+                            <Download size={14} />
+                            Download
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={downloadRawFile}
+                            className="gap-2 cursor-pointer"
+                          >
+                            <Download size={14} />
+                            Download Raw
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => {
+                              if (selectedPath) {
+                                navigator.clipboard.writeText(selectedPath);
+                                toast.success("Path copied", {
+                                  description: selectedPath,
+                                });
+                              }
+                            }}
+                            className="gap-2 cursor-pointer"
+                          >
+                            <Clipboard size={14} />
+                            Copy Path
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={async () => {
+                              const token =
+                                await getAuth().currentUser?.getIdToken();
+
+                              window.open(
+                                `/api/project/file/raw?projectId=${project.projectId}&filePath=${encodeURIComponent(selectedPath)}&token=${encodeURIComponent(token!)}`,
+                                "_blank",
+                                "noopener,noreferrer",
+                              );
+                            }}
+                          >
+                            <ExternalLink className="h-4 w-4" />
+                            Open in New Tab
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => setShowRawData((prev) => !prev)}
+                            className="gap-2 cursor-pointer"
+                          >
+                            <Code2 size={14} />
+                            {showRawData
+                              ? "View Syntax Highlighted"
+                              : "View Raw"}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  </div>
+
+                  <div className="mb-4 flex flex-wrap w-full items-center gap-3">
+                    <input
+                      type="text"
+                      placeholder="Search in file..."
+                      value={searchTerm}
+                      onChange={(e) => handleSearchChange(e)}
+                      className="h-10 w-full text-sm px-3 py-2 rounded-md border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                    />
+                  </div>
+
+                  <CodeEditorPanel
+                    fileContent={fileContent}
+                    selectedPath={selectedPath}
+                    showRawData={showRawData}
+                    isLargeFile={isLargeFile}
+                    lineCount={lineCount}
+                    codeContainerRef={codeContainerRef}
+                    getLanguageMeta={getLanguageMeta}
+                    targetLineNumber={targetLineNumber}
+                    comments={comments}
+                    hoveredLine={hoveredLine}
+                    hoveredLinePos={hoveredLinePos}
+                    setHoveredLine={setHoveredLine}
+                    setHoveredLinePos={setHoveredLinePos}
+                    openCommentDialog={openCommentDialog}
+                    commentText={commentText}
+                    setCommentText={setCommentText}
+                    setOpenCommentDialog={setOpenCommentDialog}
+                    addComment={addComment}
+                    foldedRanges={foldedRanges}
+                    foldBlocks={foldBlocks}
+                    foldPositions={foldPositions}
+                    toggleFold={toggleFold}
+                    isLineHidden={isLineHidden}
+                    handleMouseEnterLine={handleMouseEnterLine}
+                    innerScrollLeft={innerScrollLeft}
+                  />
+                </div>
+
+                <div className="min-h-0 h-full overflow-y-auto lg:min-w-0">
+                  <FileInsightsSidebar
+                    selectedFileNode={selectedFileNode}
+                    dependencyAnalysis={dependencyAnalysis}
+                    setSelectedPath={setSelectedPath}
+                    setShowDocs={setShowDocs}
+                    showDocs={showDocs}
+                    jumpToLine={jumpToLine}
+                  />
+                </div>
+              </div>
+            ) : readmeContent ? (
+              <>
+                {readmeSummary && (
+                  <div className="bg-muted border border-border rounded-lg p-4 mb-6">
+                    <h2 className="text-base font-semibold mb-2 flex items-center gap-1">
+                      <BookText className="w-4 h-4 text-primary" />
+                      README Summary
+                    </h2>
+                    <p className="text-sm text-muted-foreground">
+                      {readmeSummary}
+                    </p>
+                  </div>
+                )}
+
+                <h2 className="text-base font-bold mb-2">README.md</h2>
+                <div className="prose prose-sm max-w-none text-foreground prose-headings:mb-2 prose-p:mb-1">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {readmeContent}
+                  </ReactMarkdown>
+                </div>
+              </>
+            ) : (
+              <p className="text-muted-foreground text-sm text-center py-20">
+                Select a file to preview its content.
+              </p>
+            )
+          ) : (
+            <>
+              <div className="flex-1 overflow-hidden">
+                <FlowVisualizer
+                  selectedPath={selectedPath}
+                  id={id}
+                  graphData={graphData}
+                  setGraphData={setGraphData}
+                  selectedFileNode={selectedFileNode}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// FileInsightsSidebar
+
+"use client";
+
+import React from "react";
+import { Badge, BookText, FileWarning, ListTodo } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+
+import { ImpactSummaryCard } from "./ImpactSummaryCard";
+import { ProjectDependencyAnalysis } from "@/app/api/lib/analyzer/types";
+
+interface Props {
+  selectedFileNode: any;
+  dependencyAnalysis?: ProjectDependencyAnalysis;
+
+  setSelectedPath: (path: string) => void;
+  setShowDocs: React.Dispatch<React.SetStateAction<boolean>>;
+  showDocs: boolean;
+  jumpToLine: (line: number) => void;
+}
+
+export default function FileInsightsSidebar({
+  selectedFileNode,
+  dependencyAnalysis,
+  setSelectedPath,
+  setShowDocs,
+  showDocs,
+  jumpToLine,
+}: Props) {
+  return (
+    <div className="w-full min-w-0 overflow-y-auto pr-1">
+      <div className="space-y-4 pt-1">
+        {dependencyAnalysis && (
+          <div className="rounded-xl border bg-card p-3 sm:p-4">
+            <ImpactSummaryCard
+              dependencyAnalysis={dependencyAnalysis}
+              selectedFileNode={selectedFileNode}
+              onFileChange={setSelectedPath}
+            />
+          </div>
+        )}
+
+        {selectedFileNode?.language && (
+          <>
+            <div className="border rounded-xl p-3 bg-background">
+              <div className="flex items-center gap-2">
+                <div className="flex items-baseline gap-2 text-sm text-muted-foreground mb-4">
+                  <div
+                    className="w-2.5 h-2.5 rounded-full"
+                    style={{
+                      backgroundColor:
+                        selectedFileNode.languageColor || "#6b7280",
+                    }}
+                  />
+                  <span className="font-medium text-foreground">
+                    {selectedFileNode.language}
+                  </span>
+                </div>
+                {selectedFileNode.entry && (
+                  <abbr title="Entry point">
+                    <span className="inline-block h-2.5 w-2.5 rounded-full bg-green-500" />
+                  </abbr>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {selectedFileNode?.tags?.length > 0 && (
+          <div className="border rounded-xl p-3 bg-background">
+            <div className="flex flex-wrap gap-2 text-xs">
+              {selectedFileNode?.tags?.map((tag: string, index: number) => (
+                <Badge
+                  key={index}
+                  className="bg-muted text-muted-foreground hover:bg-accent"
+                >
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="border rounded-xl p-3 bg-background space-y-3">
+          <Button
+            className="h-10 w-full"
+            variant="outline"
+            onClick={() => setShowDocs((prev) => !prev)}
+          >
+            Docs
+          </Button>
+          {showDocs && (
+            <div className="bg-card border rounded-xl p-3">
+              <details open>
+                <summary className="p-2 font-bold cursor-pointer">
+                  API Endpoints
+                </summary>
+                <ul className="px-4">
+                  {selectedFileNode.apis?.map((api: any, i: number) => (
+                    <li
+                      key={i}
+                      className="py-1 cursor-pointer"
+                      onClick={() => jumpToLine(api.start)}
+                    >
+                      <code className="font-mono text-green-600">
+                        {api.method.toUpperCase()}
+                      </code>
+                      <span className="ml-2 min-w-0 break-words">
+                        {api.path}
+                      </span>
+                      {api.framework && (
+                        <span className="ml-2 text-xs text-gray-500">
+                          [{api.framework}]
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+              <details open>
+                <summary className="p-2 font-bold cursor-pointer">
+                  Schemas
+                </summary>
+                <ul className="px-4">
+                  {selectedFileNode.schemas?.map((schema: any, i: number) => (
+                    <li key={i} className="py-2">
+                      <span className="font-semibold">{schema.name}</span>
+                      <ul className="ml-4 text-sm text-gray-700">
+                        {schema.fields?.map((f: any, j: number) => (
+                          <li key={j}>
+                            <code className="text-purple-600">{f.name}</code>
+                            {f.type && (
+                              <span className="ml-1 text-xs text-gray-500">
+                                : {f.type}
+                              </span>
+                            )}
+                            {f.subFields && f.subFields.length > 0 && (
+                              <ul className="ml-4 text-xs text-gray-500">
+                                {f.subFields.map((sf: any, k: number) => (
+                                  <li key={k}>
+                                    {sf.name}
+                                    {sf.type && `: ${sf.type}`}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </div>
+          )}
+        </div>
+
+        {selectedFileNode && (
+          <div className="border rounded-xl p-3 bg-background">
+            <details open className="text-sm">
+              <summary className="cursor-pointer font-medium text-foreground">
+                Code Outline
+              </summary>
+
+              <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                {[
+                  {
+                    title: "Imports",
+                    data: selectedFileNode.imports,
+                  },
+                  {
+                    title: "Functions",
+                    data: selectedFileNode.functions,
+                  },
+                  {
+                    title: "Classes",
+                    data: selectedFileNode.classes,
+                  },
+                  {
+                    title: "Components",
+                    data: selectedFileNode.components,
+                  },
+                  {
+                    title: "Exports",
+                    data: selectedFileNode.exports,
+                  },
+                ].map(
+                  ({ title, data }) =>
+                    data?.length > 0 && (
+                      <div key={title} className="min-w-0">
+                        <h4 className="font-semibold text-muted-foreground mb-1">
+                          {title}
+                        </h4>
+
+                        <ul className="space-y-1 text-muted-foreground">
+                          {data.map((item: any, i: number) => (
+                            <li key={i} className="min-w-0">
+                              <button
+                                type="button"
+                                onClick={() => jumpToLine(item.start)}
+                                title={item.name}
+                                className="w-full min-w-0 truncate rounded px-1 py-0.5 text-left transition-colors hover:bg-muted hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                              >
+                                {item.name}
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ),
+                )}
+              </div>
+            </details>
+          </div>
+        )}
+
+        <Card className="rounded-xl border bg-background">
+          <CardHeader className="pb-2">
+            <h3 className="text-base font-semibold">Cross-File Impact</h3>
+          </CardHeader>
+
+          <CardContent className="space-y-4 text-sm">
+            <div>
+              <div className="font-medium text-gray-700 mb-1">Imports</div>
+              {selectedFileNode?.impact?.imports?.length ? (
+                <ul className="ml-4 list-disc space-y-1 text-gray-600 break-all">
+                  {selectedFileNode?.impact.imports.map((imp: string) => (
+                    <li
+                      key={imp}
+                      className="cursor-pointer hover:text-gray-900 hover:underline"
+                      onClick={() => setSelectedPath(imp)}
+                    >
+                      {imp}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="ml-2 text-gray-400">None</p>
+              )}
+            </div>
+
+            <div>
+              <div className="font-medium text-gray-700 mb-1">Used By</div>
+              {selectedFileNode?.impact?.usedBy.length ? (
+                <ul className="ml-4 list-disc space-y-1 text-gray-600 break-all">
+                  {selectedFileNode?.impact.usedBy.map((file: string) => (
+                    <li
+                      key={file}
+                      className="cursor-pointer hover:text-gray-900 hover:underline"
+                      onClick={() => setSelectedPath(file)}
+                    >
+                      {file}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="ml-2 text-gray-400">None</p>
+              )}
+            </div>
+
+            {selectedFileNode?.impact?.brokenImports?.length > 0 && (
+              <div className="rounded-xl border border-red-200 bg-red-50 p-3">
+                <div className="flex items-center gap-2 font-medium text-red-700 mb-1">
+                  ⚠ Broken Imports
+                </div>
+
+                <ul className="ml-4 list-disc space-y-1 text-red-600">
+                  {selectedFileNode?.impact.brokenImports.map(
+                    (b: { source: string }, i: number) => (
+                      <li key={i} className="break-all font-mono text-xs">
+                        {b.source}
+                      </li>
+                    ),
+                  )}
+                </ul>
+
+                <p className="mt-2 text-xs text-red-500">
+                  These imports no longer resolve to any file in the project.
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {selectedFileNode?.highlights &&
+          (selectedFileNode.highlights.todos?.length > 0 ||
+            selectedFileNode.highlights.fixmes?.length > 0 ||
+            selectedFileNode.highlights.notes?.length > 0) && (
+            <div className="border rounded-xl p-3 bg-background">
+              {selectedFileNode?.highlights && (
+                <div className="space-y-4">
+                  {[
+                    {
+                      title: "TODOs",
+                      icon: <ListTodo className="w-4 h-4 text-yellow-600" />,
+                      color: "text-yellow-700",
+                      items: selectedFileNode.highlights.todos,
+                    },
+                    {
+                      title: "FIXMEs",
+                      icon: <FileWarning className="w-4 h-4 text-red-600" />,
+                      color: "text-red-700",
+                      items: selectedFileNode.highlights.fixmes,
+                    },
+                    {
+                      title: "Notes",
+                      icon: <BookText className="w-4 h-4 text-blue-600" />,
+                      color: "text-blue-700",
+                      items: selectedFileNode.highlights.notes,
+                    },
+                  ].map(
+                    ({ title, icon, color, items }) =>
+                      items?.length > 0 && (
+                        <div key={title}>
+                          <div
+                            className={`flex items-center gap-2 mb-1 font-semibold ${color.replace(
+                              "700",
+                              "600",
+                            )}`}
+                          >
+                            {icon}
+                            {title}
+                          </div>
+                          <ul
+                            className={`ml-5 list-disc space-y-1 break-words text-sm ${color}`}
+                          >
+                            {items.map((item: string, i: number) => (
+                              <li key={i}>{item}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ),
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+      </div>
+    </div>
+  );
+}
+
+// FlowVisualizer
+
+"use client";
+
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import ReactFlow, {
+  Background,
+  Controls,
+  MiniMap,
+  Position,
+  MarkerType,
+  Node,
+  NodeTypes,
+  OnInit,
+  ReactFlowInstance,
+} from "reactflow";
+
+import "reactflow/dist/style.css";
+
+import { NODE_H, NODE_W, getDagreGraph } from "../utils/graphLayout";
+import { FlowGraph } from "@/app/api/lib/analyzer/types";
+
+import {
+  collectReachable,
+  normalizePath,
+  normalizeType,
+} from "../utils/graphHelpers";
+
+import { typeColors } from "../utils/graphStyles";
+import CustomNode from "./graph/CustomNode";
+import { buildVisualNodes } from "../utils/buildVisualNodes";
+import GraphToolbar from "./graph/GraphToolbar";
+
+import { ChevronDown, ChevronUp, X } from "lucide-react";
+import { getAuth } from "firebase/auth";
+
+type GraphMode = "full" | "disabled";
+
+interface Props {
+  selectedPath: string | null;
+  id: any;
+  graphData: FlowGraph;
+  setGraphData: any;
+  selectedFileNode: any;
+}
+
+const nodeTypes: NodeTypes = {
+  custom: CustomNode,
+  root: CustomNode,
+  file: CustomNode,
+  function: CustomNode,
+  "fn-entry": CustomNode,
+  if: CustomNode,
+  "if-true": CustomNode,
+  "if-false": CustomNode,
+  loop: CustomNode,
+  "loop-body": CustomNode,
+  "after-loop": CustomNode,
+  statement: CustomNode,
+  trycatch: CustomNode,
+  error: CustomNode,
+};
+
+export default function FlowVisualizer({
+  selectedPath,
+  id,
+  graphData,
+  setGraphData,
+  selectedFileNode,
+}: Props) {
+  const [heatmapMode, setHeatmapMode] = useState<
+    "none" | "complexity" | "importance"
+  >("none");
+
+  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
+  const [filterType, setFilterType] = useState<string | null>(null);
+  const [showVisualizer, setShowVisualizer] = useState(true);
+  const [hideDeadCode, setHideDeadCode] = useState(false);
+  const [showLegend, setShowLegend] = useState(false);
+
+  const rfInstanceRef = useRef<ReactFlowInstance | null>(null);
+
+  const selectedFile = selectedFileNode?.fullPath || null;
+
+  useEffect(() => {
+    const fetchGraphData = async () => {
+      const token = await getAuth().currentUser?.getIdToken();
+
+      const res = await fetch(
+        `/api/projects/${id}/graph?filePath=${encodeURIComponent(selectedPath!)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      const data = await res.json();
+      console.log(data);
+
+      if (!res.ok) {
+        throw new Error(data?.error ?? "Failed to load file graph.");
+      }
+
+      setGraphData(data?.graph);
+    };
+
+    fetchGraphData();
+  }, [selectedFile, selectedPath]);
+
+  useEffect(() => {
+    setSelectedNode(null);
+    setFilterType(null);
+  }, [selectedFile]);
+
+  const scopedGraph = useMemo(() => {
+    if (!selectedFile || !graphData?.nodes?.length) {
+      return {
+        nodes: [],
+        edges: [],
+      };
+    }
+
+    const normalizedSelectedFile = normalizePath(selectedFile);
+
+    const graphMetaFile = normalizePath(graphData.meta?.file);
+
+    const fileNodes = graphData.nodes.filter((node: any) => {
+      const nodeFile = normalizePath(node.file);
+
+      if (nodeFile === normalizedSelectedFile) {
+        return true;
+      }
+
+      if (!node.file && graphMetaFile === normalizedSelectedFile) {
+        return true;
+      }
+
+      return false;
+    });
+
+    const nodeIds = new Set(fileNodes.map((node: any) => node.id));
+
+    const fileEdges = (graphData.edges ?? []).filter(
+      (edge: any) => nodeIds.has(edge.from) && nodeIds.has(edge.to),
+    );
+
+    return {
+      nodes: fileNodes.map((node: any) => ({
+        id: node.id,
+        type: "custom",
+        position: { x: 0, y: 0 },
+        data: {
+          raw: node,
+        },
+        draggable: false,
+        sourcePosition: Position.Bottom,
+        targetPosition: Position.Top,
+      })),
+
+      edges: fileEdges.map((edge: any) => ({
+        id: edge.id,
+        source: edge.from,
+        target: edge.to,
+        label: edge.label,
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+        },
+      })),
+    };
+  }, [graphData, selectedFile]);
+
+  const nodeCount = scopedGraph.nodes.length;
+  const edgeCount = scopedGraph.edges.length;
+
+  const graphMode: GraphMode = useMemo(
+    () => (nodeCount > 1300 || edgeCount > 2500 ? "disabled" : "full"),
+    [nodeCount, edgeCount],
+  );
+
+  const resetGraphState = useCallback(() => {
+    setHeatmapMode("none");
+    setFilterType(null);
+    setSelectedNode(null);
+  }, []);
+
+  const focusedFunctionId = useMemo(() => {
+    if (selectedNode && selectedNode.data?.raw?.type === "function") {
+      return selectedNode.id;
+    }
+
+    return null;
+  }, [selectedNode]);
+
+  const onNodeClick = useCallback((_event: React.MouseEvent, node: Node) => {
+    setSelectedNode(node);
+  }, []);
+
+  const onPaneClick = useCallback(() => {
+    setSelectedNode(null);
+  }, []);
+
+  const colorBySemantic = useCallback(
+    (node: any) => {
+      const semantic = node.semantic ?? {};
+
+      if (heatmapMode === "complexity") {
+        const complexity = semantic.complexity ?? 1;
+
+        if (complexity >= 8) return "#7f1d1d";
+        if (complexity >= 5) return "#c2410c";
+        if (complexity >= 3) return "#f59e0b";
+
+        return "#fde68a";
+      }
+
+      if (heatmapMode === "importance") {
+        const importance = semantic.importance ?? 0;
+
+        if (importance > 0.75) return "#065f46";
+        if (importance > 0.4) return "#10b981";
+        if (importance > 0.15) return "#34d399";
+
+        return "#bbf7d0";
+      }
+
+      return typeColors[node.type] || "#fff";
+    },
+    [heatmapMode],
+  );
+
+  const layoutedGraph = useMemo(() => {
+    if (graphMode !== "full") {
+      return scopedGraph;
+    }
+
+    if (!scopedGraph.nodes.length) {
+      return scopedGraph;
+    }
+
+    const graph = getDagreGraph(scopedGraph.nodes, scopedGraph.edges, "TB");
+
+    return {
+      nodes: scopedGraph.nodes.map((node) => {
+        const position = graph.node(node.id);
+
+        if (!position) {
+          return node;
+        }
+
+        return {
+          ...node,
+          position: {
+            x: position.x - NODE_W / 2,
+            y: position.y - NODE_H / 2,
+          },
+        };
+      }),
+
+      edges: scopedGraph.edges,
+    };
+  }, [scopedGraph, graphMode]);
+
+  const adjacency = useMemo(() => {
+    const forward = new Map<string, string[]>();
+    const backward = new Map<string, string[]>();
+
+    for (const edge of layoutedGraph.edges) {
+      const source = String(edge.source);
+      const target = String(edge.target);
+
+      if (!forward.has(source)) {
+        forward.set(source, []);
+      }
+
+      if (!backward.has(target)) {
+        backward.set(target, []);
+      }
+
+      forward.get(source)!.push(target);
+      backward.get(target)!.push(source);
+    }
+
+    return {
+      forward,
+      backward,
+    };
+  }, [layoutedGraph]);
+
+  const functionFocusedNodes = useMemo(() => {
+    if (!focusedFunctionId) {
+      return null;
+    }
+
+    return collectReachable(focusedFunctionId, adjacency.forward);
+  }, [focusedFunctionId, adjacency]);
+
+  const highlightedNodes = useMemo(() => {
+    if (!selectedNode) {
+      return null;
+    }
+
+    const forwardSet = collectReachable(selectedNode.id, adjacency.forward);
+
+    const backwardSet = collectReachable(selectedNode.id, adjacency.backward);
+
+    return new Set([...Array.from(forwardSet), ...Array.from(backwardSet)]);
+  }, [selectedNode, adjacency]);
+
+  const visualNodes = useMemo(() => {
+    return buildVisualNodes({
+      nodes: layoutedGraph.nodes,
+      filterType,
+      selectedNode,
+      highlightedNodes,
+      hideDeadCode,
+      functionFocusedNodes,
+      normalizeType,
+      colorBySemantic,
+    });
+  }, [
+    layoutedGraph,
+    filterType,
+    selectedNode,
+    highlightedNodes,
+    hideDeadCode,
+    functionFocusedNodes,
+    colorBySemantic,
+  ]);
+
+  const visualEdges = useMemo(() => {
+    const hasSelection = !!selectedNode;
+
+    return layoutedGraph.edges.map((edge) => {
+      const isOnPath =
+        !hasSelection ||
+        (highlightedNodes &&
+          highlightedNodes.has(String(edge.source)) &&
+          highlightedNodes.has(String(edge.target)));
+
+      return {
+        ...edge,
+
+        style: {
+          stroke: isOnPath ? "#2563EB" : "#9CA3AF",
+          strokeWidth: isOnPath ? 2.5 : 1.2,
+          opacity: isOnPath ? 1 : 0.4,
+        },
+
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+        },
+      };
+    });
+  }, [layoutedGraph, highlightedNodes, selectedNode]);
+
+  const onInit: OnInit = useCallback((instance: ReactFlowInstance) => {
+    rfInstanceRef.current = instance;
+
+    requestAnimationFrame(() => {
+      instance.fitView({
+        padding: 0.2,
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!rfInstanceRef.current || !visualNodes.length) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      rfInstanceRef.current?.fitView({
+        padding: 0.2,
+      });
+    });
+  }, [selectedFile, visualNodes.length]);
+
+  if (!selectedFileNode) {
+    return (
+      <div className="py-20 text-center">
+        <p className="text-sm text-muted-foreground">
+          Select a file to explore Code Flow Visualization.
+        </p>
+      </div>
+    );
+  }
+
+  if (!graphData || !graphData.nodes?.length) {
+    return (
+      <div className="rounded-xl border border-dashed p-6 text-center">
+        <p className="text-sm font-medium">
+          Execution graph is not available yet.
+        </p>
+
+        <p className="mt-1 text-xs text-muted-foreground">
+          Select another file or wait for the file-level graph to finish
+          loading.
+        </p>
+      </div>
+    );
+  }
+
+  if (!scopedGraph.nodes.length) {
+    return (
+      <div className="rounded-xl border border-dashed p-6 text-center">
+        <p className="text-sm font-medium">
+          No execution nodes found for this file.
+        </p>
+
+        <p className="mt-1 text-xs text-muted-foreground">
+          This file may not contain executable code or its graph may still be
+          loading.
+        </p>
+      </div>
+    );
+  }
+
+  if (graphMode === "disabled") {
+    return (
+      <div className="rounded-xl border border-yellow-300 bg-yellow-50 p-6">
+        <h3 className="mb-2 font-semibold text-yellow-800">
+          ⚠ Execution graph too large
+        </h3>
+
+        <p className="text-sm text-yellow-700">
+          This file contains <b>{nodeCount}</b> execution nodes and{" "}
+          <b>{edgeCount}</b> edges.
+        </p>
+
+        <p className="mt-2 text-sm text-yellow-700">
+          Rendering this file-level execution graph may freeze your browser. Use
+          Code Outline and Cross-File Impact for deeper navigation.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-6">
+      <div
+        className="flex cursor-pointer select-none items-center justify-between rounded-t-xl border border-gray-200 bg-gray-100 px-4 py-2"
+        onClick={() => setShowVisualizer((value) => !value)}
+      >
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+          Code Flow Visualization
+        </h2>
+
+        <span className="text-sm text-gray-500">
+          {showVisualizer ? <ChevronUp /> : <ChevronDown />}
+        </span>
+      </div>
+
+      <div
+        className={`w-full overflow-hidden rounded-b-xl border-x border-b border-gray-200 transition-all duration-300 ease-in-out ${
+          showVisualizer
+            ? "h-[65vh] sm:h-[70vh] md:h-[75vh] lg:h-[80vh] xl:h-[85vh]"
+            : "h-0"
+        }`}
+      >
+        <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg bg-muted/20">
+          <GraphToolbar
+            heatmapMode={heatmapMode}
+            setHeatmapMode={setHeatmapMode}
+            filterType={filterType}
+            setFilterType={setFilterType}
+            hideDeadCode={hideDeadCode}
+            setHideDeadCode={setHideDeadCode}
+            showLegend={showLegend}
+            setShowLegend={setShowLegend}
+            resetGraphState={resetGraphState}
+          />
+
+          <div className="relative h-full min-h-0 w-full flex-1 overflow-hidden">
+            <ReactFlow
+              nodes={visualNodes}
+              edges={visualEdges}
+              onInit={onInit}
+              onNodeClick={onNodeClick}
+              onPaneClick={onPaneClick}
+              nodeTypes={nodeTypes}
+              panOnScroll
+              zoomOnPinch
+              panOnDrag
+              fitView
+              style={{
+                background: "hsl(var(--background))",
+                height: "100%",
+                width: "100%",
+              }}
+            >
+              <Background color="#e0e0e0" gap={20} />
+
+              <MiniMap
+                nodeColor={(node: Node) =>
+                  (node.data?.color as string) || "#ccc"
+                }
+                style={{
+                  borderRadius: 12,
+                  boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
+                }}
+                zoomable
+                pannable
+                maskColor="rgba(0, 0, 0, .08)"
+              />
+
+              <Controls showInteractive={false} position="bottom-left" />
+            </ReactFlow>
+
+            {showLegend && (
+              <div className="absolute right-3 top-3 z-50 max-h-[calc(100%-24px)] w-[min(260px,calc(100%-24px))] overflow-y-auto rounded-xl border bg-white p-3 text-xs text-gray-700 shadow-xl">
+                <div className="flex items-center justify-between border-b pb-3">
+                  <h3 className="text-sm font-semibold">Graph Legend</h3>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowLegend(false)}
+                    className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    aria-label="Close graph legend"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="mt-2 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full bg-green-500" />
+                    <span>Function</span>
+                    <span>— entry & body</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full bg-blue-500" />
+                    <span>If / Branch</span>
+                    <span>— conditional paths</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full bg-purple-500" />
+                    <span>Loop</span>
+                    <span>— iterative flow</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full border border-gray-300 bg-white" />
+                    <span>Statement</span>
+                    <span>— linear execution</span>
+                  </div>
+                </div>
+
+                <hr className="my-2" />
+
+                <div>
+                  <b>Heatmap</b>
+                  <div>• Darker = higher complexity / importance</div>
+                </div>
+
+                <hr className="my-2" />
+
+                <div>
+                  <b>Faded nodes</b>
+                  <div>• Filtered out</div>
+                  <div>• Dead / unreachable</div>
+                  <div>• Outside execution path</div>
+                </div>
+
+                <hr className="my-2" />
+
+                <div>
+                  <b>Edges</b>
+                  <div>• Solid → execution order</div>
+                  <div>• Branch → true / false</div>
+                  <div>• Loop-back → iteration</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// graphLayout
+
+import dagre from "dagre";
+import { Node, Edge } from "reactflow";
+
+export const NODE_W = 240;
+export const NODE_H = 70;
+
+export function getDagreGraph(nodes: Node[], edges: Edge[], direction = "TB") {
+  const g = new dagre.graphlib.Graph({
+    multigraph: true,
+  });
+
+  g.setDefaultEdgeLabel(() => ({}));
+
+  g.setGraph({
+    rankdir: direction,
+    nodesep: 60,
+    ranksep: 90,
+  });
+
+  nodes.forEach((n) =>
+    g.setNode(n.id, {
+      width: NODE_W,
+      height: NODE_H,
+    }),
+  );
+
+  edges.forEach((e) => {
+    if (e.source && e.target) {
+      g.setEdge(e.source as string, e.target as string);
+    }
+  });
+
+  dagre.layout(g);
+
+  return g;
+}
+
+// GraphToolbar
+
+"use client";
+
+import React from "react";
+
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+import { Button } from "@/components/ui/button";
+
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
+import { BookOpen, Flame, RotateCcw } from "lucide-react";
+
+interface GraphToolbarProps {
+  heatmapMode: "none" | "complexity" | "importance";
+  setHeatmapMode: (value: "none" | "complexity" | "importance") => void;
+
+  filterType: string | null;
+  setFilterType: (value: string | null) => void;
+
+  hideDeadCode: boolean;
+  setHideDeadCode: (value: boolean) => void;
+
+  showLegend: boolean;
+  setShowLegend: (value: boolean) => void;
+
+  resetGraphState: () => void;
+}
+
+export default function GraphToolbar({
+  heatmapMode,
+  setHeatmapMode,
+  filterType,
+  setFilterType,
+  hideDeadCode,
+  setHideDeadCode,
+  showLegend,
+  setShowLegend,
+  resetGraphState,
+}: GraphToolbarProps) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b bg-background px-3 py-3 sm:px-4">
+      <Select
+        value={heatmapMode}
+        onValueChange={(value) =>
+          setHeatmapMode(value as "none" | "complexity" | "importance")
+        }
+      >
+        <SelectTrigger className="w-full sm:w-[180px] lg:w-[200px]">
+          <div className="flex min-w-0 items-center gap-2">
+            <Flame className="h-4 w-4 shrink-0" />
+
+            <span className="truncate text-muted-foreground">Heatmap:</span>
+
+            <SelectValue />
+          </div>
+        </SelectTrigger>
+
+        <SelectContent className="z-50 border bg-white text-popover-foreground shadow-lg">
+          <SelectItem value="none">Off</SelectItem>
+
+          <SelectItem value="complexity">Complexity</SelectItem>
+
+          <SelectItem value="importance">Importance</SelectItem>
+        </SelectContent>
+      </Select>
+
+      <Select
+        value={filterType ?? "all"}
+        onValueChange={(value) => setFilterType(value === "all" ? null : value)}
+      >
+        <SelectTrigger className="w-full sm:w-[180px] lg:w-[200px]">
+          <SelectValue placeholder="Filter" />
+        </SelectTrigger>
+
+        <SelectContent className="z-50 border bg-white text-popover-foreground shadow-lg">
+          <SelectItem value="all">All Nodes</SelectItem>
+
+          <SelectItem value="function">Functions</SelectItem>
+
+          <SelectItem value="if">Branches</SelectItem>
+
+          <SelectItem value="loop">Loops</SelectItem>
+
+          <SelectItem value="statement">Statements</SelectItem>
+        </SelectContent>
+      </Select>
+
+      {/*
+        Dead-code filtering is intentionally kept disabled for now.
+      */}
+
+      <div className="ml-auto flex w-full items-center justify-end gap-2 sm:w-auto">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowLegend(!showLegend)}
+              >
+                <BookOpen size={16} className="mr-2 h-4 w-4" />
+                Legend
+              </Button>
+            </TooltipTrigger>
+
+            <TooltipContent>Toggle graph legend</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+
+        <Button size="sm" onClick={resetGraphState}>
+          <RotateCcw className="mr-1 h-4 w-4" />
+          Reset
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// graphHelpers
+
+export function collectReachable(start: string, adj: Map<string, string[]>) {
+  const visited = new Set<string>();
+  const queue = [start];
+
+  let index = 0;
+
+  while (index < queue.length) {
+    const current = queue[index++];
+
+    if (visited.has(current)) continue;
+
+    visited.add(current);
+
+    for (const next of adj.get(current) ?? []) {
+      if (!visited.has(next)) {
+        queue.push(next);
+      }
+    }
+  }
+
+  return visited;
+}
+
+export function normalizePath(p?: string) {
+  if (!p) return null;
+  return p.replace(/^\/+/, "").replace(/\\/g, "/");
+}
+
+export function normalizeType(type?: string) {
+  if (!type) return "statement";
+
+  const t = type.toLowerCase();
+
+  if (t.includes("function")) return "function";
+
+  if (t.includes("loop") || t.includes("for") || t.includes("while")) {
+    return "loop";
+  }
+
+  if (t.includes("if") || t.includes("switch") || t.includes("case")) {
+    return "if";
+  }
+
+  if (t.includes("return")) return "statement";
+
+  return t;
+}
+
+// CustomNode
+
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+import { Handle, Position } from "reactflow";
+import { NODE_H, NODE_W } from "../../utils/graphLayout";
+import { baseNodeStyle } from "../../utils/graphStyles";
+
+export default function CustomNode({ data }: any) {
+  const nodeRef = useRef<HTMLDivElement | null>(null);
+
+  const [tooltipEl, setTooltipEl] = useState<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let el = document.getElementById("flow-tooltip") as HTMLDivElement | null;
+
+    if (!el) {
+      el = document.createElement("div");
+
+      el.id = "flow-tooltip";
+
+      el.style.position = "fixed";
+      el.style.zIndex = "99999";
+      el.style.pointerEvents = "none";
+      el.style.background = "rgba(0,0,0,0.85)";
+      el.style.color = "#fff";
+      el.style.padding = "6px 8px";
+      el.style.borderRadius = "6px";
+      el.style.fontSize = "11px";
+      el.style.maxWidth = "480px";
+      el.style.whiteSpace = "pre-wrap";
+      el.style.display = "none";
+
+      document.body.appendChild(el);
+    }
+
+    setTooltipEl(el);
+
+    return () => {};
+  }, []);
+
+  const filterOpacity = data?.fadedByFilter ? 0.15 : 1;
+  const highlightOpacity = data?.fadedByHighlight ? 0.08 : 1;
+  const deadOpacity = data?.fadedByDead ? 0.05 : 1;
+  const functionFocusOpacity = data?.fadedByFunctionFocus ? 0.05 : 1;
+
+  const finalOpacity = Math.min(
+    filterOpacity,
+    highlightOpacity,
+    deadOpacity,
+    functionFocusOpacity,
+  );
+
+  const isDead = data?.fadedByDead;
+
+  const showTooltip = () => {
+    if (!nodeRef.current || !tooltipEl) return;
+
+    const rect = nodeRef.current.getBoundingClientRect();
+    tooltipEl.textContent =
+      (data?.raw?.code ?? "No code") +
+      (data?.fadedByDead ? "\n⚠ Dead / unreachable code" : "");
+
+    tooltipEl.style.left = `${rect.left + rect.width / 2}px`;
+    tooltipEl.style.top = `${rect.bottom + 6}px`;
+    tooltipEl.style.transform = "translateX(-50%)";
+    tooltipEl.style.display = "block";
+  };
+
+  const hideTooltip = () => {
+    if (!tooltipEl) return;
+
+    setTimeout(() => {
+      tooltipEl.style.display = "none";
+    }, 600);
+  };
+
+  return (
+    <div
+      ref={nodeRef}
+      onMouseEnter={showTooltip}
+      onMouseLeave={hideTooltip}
+      style={{
+        ...baseNodeStyle,
+        background: data?.color || "#fff",
+        width: NODE_W - 24,
+        height: NODE_H - 24,
+        opacity: finalOpacity,
+        border: isDead ? "1px dashed #9CA3AF" : "1px solid #ccc",
+        transform: data?.focused ? "scale(1.08)" : "scale(1)",
+        boxShadow: data?.focused
+          ? "0 0 0 3px rgba(59,130,246,0.6)"
+          : "0 3px 6px rgba(0,0,0,0.08)",
+        cursor: data?.fadedByFilter ? "not-allowed" : "default",
+        pointerEvents: data?.fadedByFilter ? "none" : "auto",
+      }}
+      onMouseOver={(e) =>
+        (e.currentTarget.style.boxShadow = "0 0 10px rgba(59,130,246,0.4)")
+      }
+      onMouseOut={(e) =>
+        (e.currentTarget.style.boxShadow = "0 3px 6px rgba(0,0,0,0.08)")
+      }
+    >
+      <Handle
+        type="target"
+        position={Position.Top}
+        style={{
+          opacity: 0,
+          pointerEvents: "none",
+        }}
+      />
+
+      <div
+        style={{
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          flex: 1,
+          paddingRight: 6,
+        }}
+      >
+        {data.label}
+      </div>
+
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        style={{
+          opacity: 0,
+          pointerEvents: "none",
+        }}
+      />
+    </div>
+  );
+}
+
+// buildVisualNodes
+
+import { Node } from "reactflow";
+
+interface BuildVisualNodesProps {
+  nodes: Node[];
+  filterType: string | null;
+  selectedNode: Node | null;
+  highlightedNodes: Set<string> | null;
+  hideDeadCode: boolean;
+  functionFocusedNodes: Set<string> | null;
+  normalizeType: (type: string) => string;
+  colorBySemantic: (node: any) => string;
+}
+
+export function buildVisualNodes({
+  nodes,
+  filterType,
+  selectedNode,
+  highlightedNodes,
+  hideDeadCode,
+  functionFocusedNodes,
+  normalizeType,
+  colorBySemantic,
+}: BuildVisualNodesProps): Node[] {
+  return nodes.map((node) => {
+    const raw = node.data?.raw ?? {};
+
+    const matchesFilter = !filterType || normalizeType(raw.type) === filterType;
+
+    const isHighlighted = !selectedNode || highlightedNodes?.has(node.id);
+
+    const isFocused = selectedNode?.id === node.id;
+
+    const isDead = raw.semantic?.dead === true;
+
+    const fadedByDead = hideDeadCode && isDead;
+
+    const fadedByFunctionFocus =
+      !!functionFocusedNodes && !functionFocusedNodes.has(node.id);
+
+    const color = colorBySemantic(raw);
+
+    let label: string;
+
+    if (raw.type === "root") {
+      label = "🔷 Execution Root";
+    } else if (raw.type === "function") {
+      label = `🟢 Function: ${raw.name ?? "anonymous"}`;
+    } else if (raw.type === "if") {
+      label = `🔀 ${raw.name ?? "Condition"}`;
+    } else if (raw.type === "loop") {
+      label = `🔁 ${raw.name ?? "Loop"}`;
+    } else if (raw.type === "trycatch") {
+      label = `⚠ ${raw.name ?? "Try / Catch"}`;
+    } else {
+      label = (raw.code ?? raw.name ?? raw.type ?? "").toString().slice(0, 60);
+    }
+
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        label,
+        color,
+        border: isFocused ? "2px solid #2563eb" : "1px solid #ccc",
+        fadedByFilter: !matchesFilter,
+        fadedByHighlight: !isHighlighted,
+        fadedByDead,
+        fadedByFunctionFocus,
+        focused: isFocused,
+        architectureDeadOpacity: 1,
+        graphScope: "file",
+      },
+    };
+  });
+}
+
+// ImpactSummaryCard
+
+"use client";
+
+import { useMemo, useState } from "react";
+import { AlertTriangle, ExternalLink, Flame, GitBranch } from "lucide-react";
+
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+
+import { Badge } from "@/components/ui/badge";
+
+import { ImpactDetailsDrawer } from "./ImpactDetailsDrawer";
+
+import type { ProjectDependencyAnalysis } from "@/app/api/lib/analyzer/types";
+
+type FileTreeNode = {
+  type?: string;
+  fullPath?: string;
+  children?: FileTreeNode[];
+  impact?: {
+    imports?: string[];
+    usedBy?: string[];
+    brokenImports?: {
+      source: string;
+    }[];
+  };
+};
+
+type Props = {
+  dependencyAnalysis: ProjectDependencyAnalysis;
+  selectedFileNode: any;
+  onFileChange: (path: string) => void;
+};
+
+export function ImpactSummaryCard({
+  dependencyAnalysis,
+  selectedFileNode,
+  onFileChange,
+}: Props) {
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+
+  const intelligence = dependencyAnalysis.intelligence;
+
+  const topFiles = useMemo(
+    () => intelligence.importanceRanking?.slice(0, 5) ?? [],
+    [intelligence],
+  );
+
+  const deadCount = intelligence.deadFiles?.length ?? 0;
+
+  const circularCount = intelligence.circularDependencies?.length ?? 0;
+
+  const missingDependencyCount =
+    dependencyAnalysis.stats?.missingDependencyCount ?? 0;
+
+  const riskLevel = useMemo(() => {
+    if (circularCount > 0) {
+      return {
+        label: "High",
+        className: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
+      };
+    }
+
+    if (missingDependencyCount > 0 || deadCount > 0) {
+      return {
+        label: "Medium",
+        className:
+          "bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300",
+      };
+    }
+
+    return {
+      label: "Low",
+      className:
+        "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
+    };
+  }, [circularCount, missingDependencyCount, deadCount]);
+
+  return (
+    <>
+      <Card className="rounded-2xl border shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <AlertTriangle className="h-4 w-4 text-primary" />
+
+            <span>Impact Summary</span>
+          </CardTitle>
+        </CardHeader>
+
+        <CardContent className="space-y-5">
+          <div className="grid grid-cols-2 gap-3">
+            <InfoStat
+              icon={<AlertTriangle className="h-4 w-4" />}
+              label="Risk"
+              value={
+                <Badge className={riskLevel.className}>{riskLevel.label}</Badge>
+              }
+            />
+
+            <InfoStat
+              icon={<GitBranch className="h-4 w-4" />}
+              label="Cycles"
+              value={circularCount}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <InfoStat label="Missing Imports" value={missingDependencyCount} />
+
+            <InfoStat label="Dead Candidates" value={deadCount} />
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              <Flame className="h-4 w-4 text-orange-500" />
+
+              <span>Critical Files</span>
+            </div>
+
+            {topFiles.length === 0 ? (
+              <div className="rounded-xl border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+                No importance ranking available.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {topFiles.map((file) => {
+                  const cleanPath = file.fileId.replace(/^file::/, "");
+
+                  return (
+                    <div
+                      key={file.fileId}
+                      className="rounded-xl border bg-muted/30 px-3 py-2"
+                    >
+                      <div className="flex items-start gap-3">
+                        <button
+                          type="button"
+                          onClick={() => onFileChange(cleanPath)}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <p className="break-all text-sm font-medium">
+                            {cleanPath}
+                          </p>
+                        </button>
+
+                        <Badge variant="secondary" className="shrink-0">
+                          {file.score}
+                        </Badge>
+
+                        <button
+                          type="button"
+                          onClick={() => setSelectedFile(file.fileId)}
+                          className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          aria-label={`View impact details for ${cleanPath}`}
+                        >
+                          <ExternalLink className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {selectedFile && (
+        <ImpactDetailsDrawer
+          dependencyAnalysis={dependencyAnalysis}
+          selectedFileNode={selectedFileNode}
+          fileId={selectedFile}
+          onClose={() => setSelectedFile(null)}
+          onFileChange={onFileChange}
+        />
+      )}
+    </>
+  );
+}
+
+function InfoStat({
+  icon,
+  label,
+  value,
+}: {
+  icon?: React.ReactNode;
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border bg-muted/20 px-3 py-3">
+      <div className="mb-2 flex items-center gap-2 text-muted-foreground">
+        {icon}
+
+        <span className="text-xs font-medium uppercase tracking-wide">
+          {label}
+        </span>
+      </div>
+
+      <div className="text-sm font-semibold">{value}</div>
+    </div>
+  );
+}
+
+// ImpactDetailsDrawer
+
+"use client";
+
+import { useMemo } from "react";
+import type { ProjectDependencyAnalysis } from "@/app/api/lib/analyzer/types";
+
+import {
+  AlertTriangle,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  CircleAlert,
+  FileCode2,
+  GitBranch,
+  Network,
+  X,
+} from "lucide-react";
+
+type Props = {
+  dependencyAnalysis: ProjectDependencyAnalysis;
+  selectedFileNode: any;
+  fileId: string;
+  onClose: () => void;
+  onFileChange?: (path: string) => void;
+};
+
+function cleanFileId(fileId: string) {
+  return fileId.replace(/^file::/, "");
+}
+
+export function ImpactDetailsDrawer({
+  dependencyAnalysis,
+  selectedFileNode,
+  fileId,
+  onClose,
+  onFileChange,
+}: Props) {
+  const cleanPath = useMemo(() => cleanFileId(fileId), [fileId]);
+
+  const fileNode = selectedFileNode;
+
+  const metric = useMemo(
+    () =>
+      dependencyAnalysis.fileMetrics?.find((file) => file.fileId === fileId) ??
+      null,
+    [dependencyAnalysis, fileId],
+  );
+
+  const importance = useMemo(
+    () =>
+      dependencyAnalysis.intelligence.importanceRanking?.find(
+        (file) => file.fileId === fileId,
+      )?.score ?? 0,
+    [dependencyAnalysis, fileId],
+  );
+
+  const isDead = useMemo(
+    () => dependencyAnalysis.intelligence.deadFiles?.includes(fileId) ?? false,
+    [dependencyAnalysis, fileId],
+  );
+
+  const cycle = useMemo(
+    () =>
+      dependencyAnalysis.intelligence.circularDependencies?.find((cycle) =>
+        cycle.includes(fileId),
+      ) ?? null,
+    [dependencyAnalysis, fileId],
+  );
+
+  const imports = useMemo(() => fileNode?.impact?.imports ?? [], [fileNode]);
+
+  const usedBy = useMemo(() => fileNode?.impact?.usedBy ?? [], [fileNode]);
+
+  const brokenImports = useMemo(
+    () => fileNode?.impact?.brokenImports ?? [],
+    [fileNode],
+  );
+
+  return (
+    <div className="fixed inset-0 z-50">
+      <button
+        type="button"
+        aria-label="Close impact details"
+        onClick={onClose}
+        className="absolute inset-0 bg-black/20 backdrop-blur-[1px]"
+      />
+
+      <aside className="absolute inset-y-0 right-0 w-full max-w-[460px] border-l bg-background shadow-2xl">
+        <div className="flex h-full flex-col">
+          <div className="flex items-start justify-between gap-3 border-b px-6 py-5">
+            <div className="min-w-0 flex-1">
+              <div className="mb-1 flex items-center gap-2">
+                <FileCode2 className="h-5 w-5 shrink-0 text-primary" />
+
+                <h2 className="text-lg font-semibold">Impact Details</h2>
+              </div>
+
+              <p className="break-all text-xs text-muted-foreground">
+                {cleanPath}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={onClose}
+              className="shrink-0 rounded-md p-2 transition-colors hover:bg-muted"
+              aria-label="Close"
+            >
+              <X className="h-4 w-4 text-muted-foreground" />
+            </button>
+          </div>
+
+          <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
+            <div className="grid grid-cols-2 gap-3">
+              <InfoCard
+                icon={<Network className="h-4 w-4" />}
+                label="Importance"
+                value={importance}
+              />
+
+              <InfoCard
+                icon={<GitBranch className="h-4 w-4" />}
+                label="Circular"
+                value={cycle ? "Yes" : "No"}
+              />
+            </div>
+
+            {metric && (
+              <SectionCard
+                title="Connectivity"
+                icon={<Network className="h-4 w-4" />}
+              >
+                <div className="grid grid-cols-3 gap-2">
+                  <Metric label="Incoming" value={metric.inDegree} />
+
+                  <Metric label="Outgoing" value={metric.outDegree} />
+
+                  <Metric label="Total" value={metric.totalDegree} />
+                </div>
+
+                <div className="rounded-lg border bg-muted/20 px-3 py-3">
+                  <div className="mb-1 text-xs text-muted-foreground">
+                    Connectivity score
+                  </div>
+
+                  <div className="text-sm font-semibold">
+                    {metric.score.toFixed(2)}
+                  </div>
+                </div>
+              </SectionCard>
+            )}
+
+            <SectionCard
+              title="Risk Signals"
+              icon={<AlertTriangle className="h-4 w-4" />}
+            >
+              <div className="space-y-2">
+                <StatusRow
+                  label="Circular dependency"
+                  active={Boolean(cycle)}
+                  activeText="File participates in a dependency cycle"
+                  inactiveText="No circular dependency detected"
+                />
+
+                <StatusRow
+                  label="Dead-file analysis"
+                  active={isDead}
+                  activeText="File is classified as unreachable"
+                  inactiveText="File is not classified as dead"
+                />
+
+                <StatusRow
+                  label="Broken imports"
+                  active={brokenImports.length > 0}
+                  activeText={`${brokenImports.length} broken import${
+                    brokenImports.length === 1 ? "" : "s"
+                  } detected`}
+                  inactiveText="No broken imports detected"
+                />
+              </div>
+            </SectionCard>
+
+            <SectionCard
+              title="Direct Dependents"
+              icon={<ArrowDownToLine className="h-4 w-4" />}
+            >
+              <p className="text-xs text-muted-foreground">
+                Files that directly import or depend on this file.
+              </p>
+
+              {usedBy.length === 0 ? (
+                <EmptyState text="No direct dependents found" />
+              ) : (
+                <PathList paths={usedBy} onFileChange={onFileChange} />
+              )}
+            </SectionCard>
+
+            <SectionCard
+              title="Dependencies"
+              icon={<ArrowUpFromLine className="h-4 w-4" />}
+            >
+              <p className="text-xs text-muted-foreground">
+                Files directly imported by this file.
+              </p>
+
+              {imports.length === 0 ? (
+                <EmptyState text="No internal dependencies found" />
+              ) : (
+                <PathList paths={imports} onFileChange={onFileChange} />
+              )}
+            </SectionCard>
+
+            <SectionCard
+              title="Broken Imports"
+              icon={<CircleAlert className="h-4 w-4" />}
+            >
+              {brokenImports.length === 0 ? (
+                <EmptyState text="No broken imports found" />
+              ) : (
+                <ul className="space-y-2">
+                  {brokenImports.map((item: any) => (
+                    <li
+                      key={item.source}
+                      className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm break-all text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
+                    >
+                      {item.source}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </SectionCard>
+
+            {cycle && (
+              <SectionCard
+                title="Circular Dependency"
+                icon={<GitBranch className="h-4 w-4" />}
+              >
+                <div className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-3 text-sm dark:border-violet-900 dark:bg-violet-950/30">
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    Detected cycle
+                  </p>
+
+                  <div className="break-all text-sm">
+                    {cycle.map(cleanFileId).join(" → ")}
+                  </div>
+                </div>
+              </SectionCard>
+            )}
+          </div>
+
+          {onFileChange && (
+            <div className="border-t px-6 py-4">
+              <button
+                type="button"
+                onClick={() => {
+                  onFileChange(cleanPath);
+                  onClose();
+                }}
+                className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+              >
+                Open File
+              </button>
+            </div>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function PathList({
+  paths,
+  onFileChange,
+}: {
+  paths: string[];
+  onFileChange?: (path: string) => void;
+}) {
+  return (
+    <ul className="space-y-2">
+      {paths.map((path) => {
+        const cleanPath = cleanFileId(path);
+
+        return (
+          <li key={path}>
+            {onFileChange ? (
+              <button
+                type="button"
+                onClick={() => onFileChange(cleanPath)}
+                className="w-full rounded-lg border bg-muted/30 px-3 py-2 text-left text-sm break-all transition-colors hover:bg-muted"
+              >
+                {cleanPath}
+              </button>
+            ) : (
+              <div className="rounded-lg border bg-muted/30 px-3 py-2 text-sm break-all">
+                {cleanPath}
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function StatusRow({
+  label,
+  active,
+  activeText,
+  inactiveText,
+}: {
+  label: string;
+  active: boolean;
+  activeText: string;
+  inactiveText: string;
+}) {
+  return (
+    <div className="rounded-lg border bg-muted/20 px-3 py-3">
+      <div className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+
+      <div className="text-sm font-medium">
+        {active ? activeText : inactiveText}
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border bg-muted/20 px-3 py-3 text-center">
+      <div className="text-lg font-semibold">{value}</div>
+
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  );
+}
+
+function InfoCard({
+  icon,
+  label,
+  value,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border bg-card p-4 shadow-sm">
+      <div className="mb-2 flex items-center gap-2 text-muted-foreground">
+        {icon}
+
+        <span className="text-xs font-medium uppercase tracking-wide">
+          {label}
+        </span>
+      </div>
+
+      <div className="text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function SectionCard({
+  title,
+  icon,
+  children,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="space-y-4 rounded-2xl border bg-card p-4 shadow-sm">
+      <div className="flex items-center gap-2">
+        {icon}
+
+        <h3 className="text-sm font-semibold">{title}</h3>
+      </div>
+
+      {children}
+    </section>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+      {text}
+    </div>
+  );
+}

@@ -10,22 +10,25 @@ const adm_zip_1 = __importDefault(require("adm-zip"));
 const mongoClient_1 = __importDefault(require("../../../../lib/mongoClient"));
 const jobStore_1 = require("./jobStore");
 const instrumentExecutionBabel_1 = require("../instrumentExecutionBabel");
-const mergeFileGraph_1 = require("../analyzer/mergeFileGraph");
 const normalizeGraphIds_1 = require("../analyzer/normalizeGraphIds");
 const buildCrossFileImpactMap_1 = require("../buildCrossFileImpactMap");
-const injectFileDependencyEdges_1 = require("../analyzer/injectFileDependencyEdges");
-const enrichGraphSemantics_1 = require("../analyzer/enrichGraphSemantics");
-const styleGraphEdges_1 = require("../analyzer/styleGraphEdges");
-const impactEngine_1 = require("../impactEngine");
 const language_1 = require("../language");
 const graphStore_1 = require("../graph/graphStore");
 const uploadHelpers_1 = require("../uploadHelpers");
 const extractCache_1 = require("../cache/extractCache");
 const moduleResolverConfig_1 = require("../analyzer/moduleResolverConfig");
 const fileRoleClassifier_1 = require("../analyzer/fileRoleClassifier");
+const distributedImpactEngine_1 = require("../analyzer/distributedImpactEngine");
+const fileGraphSummary_1 = require("../analyzer/fileGraphSummary");
+const fileDependecies_1 = require("../analyzer/fileDependecies");
+const enrichFileGraphSemantics_1 = require("../analyzer/enrichFileGraphSemantics");
 const CHUNK_SIZE = 50;
 function isBinaryFile(buffer) {
     return buffer.includes(0);
+}
+function isGraphSupportedFile(filePath) {
+    const ext = path_1.default.extname(filePath).toLowerCase();
+    return [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext);
 }
 const IGNORE_DIRS = new Set([
     "node_modules",
@@ -36,7 +39,6 @@ const IGNORE_DIRS = new Set([
     ".next",
     ".turbo",
     ".cache",
-    "partialGraphs",
 ]);
 function walkDir(root) {
     const results = [];
@@ -62,6 +64,57 @@ function withTimeout(promise, ms = 5000) {
         promise,
         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms)),
     ]);
+}
+function normalizeFilePath(value) {
+    return value.replace(/\\/g, "/");
+}
+function collectFileAnalysisScopes(fileTree) {
+    const entryFileIds = new Set();
+    const candidateFileIds = new Set();
+    const collect = (nodes) => {
+        var _a, _b;
+        for (const node of nodes) {
+            if (node.type === "file" && node.fullPath) {
+                const normalizedPath = normalizeFilePath(node.fullPath);
+                const fileId = `file::${normalizedPath}`;
+                if (((_a = node.entry) === null || _a === void 0 ? void 0 : _a.isLikelyEntry) && ((_b = node.entry) === null || _b === void 0 ? void 0 : _b.kind) !== "cli") {
+                    entryFileIds.add(fileId);
+                }
+                if ((0, fileRoleClassifier_1.isDeadFileCandidateRole)(node.role)) {
+                    candidateFileIds.add(fileId);
+                }
+            }
+            if (Array.isArray(node.children)) {
+                collect(node.children);
+            }
+        }
+    };
+    collect(fileTree);
+    return {
+        entryFileIds,
+        candidateFileIds,
+    };
+}
+function collectFileUniverse(fileTree) {
+    const fileIds = new Set();
+    const filePaths = new Set();
+    const collect = (nodes) => {
+        for (const node of nodes) {
+            if (node.type === "file" && node.fullPath) {
+                const normalizedPath = normalizeFilePath(node.fullPath);
+                filePaths.add(normalizedPath);
+                fileIds.add(`file::${normalizedPath}`);
+            }
+            if (Array.isArray(node.children)) {
+                collect(node.children);
+            }
+        }
+    };
+    collect(fileTree);
+    return {
+        fileIds,
+        filePaths,
+    };
 }
 async function runJobStep(job) {
     var _a, _b;
@@ -101,7 +154,6 @@ async function runJobStep(job) {
         }
         new adm_zip_1.default(zipPath).extractAllTo(extractRoot, true);
         (0, extractCache_1.cleanOldCache)();
-        fs_1.default.mkdirSync(path_1.default.join(root, "partialGraphs"), { recursive: true });
         await (0, jobStore_1.saveJob)({
             id: job.id,
             extractedPath: root,
@@ -225,16 +277,11 @@ async function runJobStep(job) {
         }
         flattenTree(fileTree);
         const slice = files.slice(cursor, cursor + CHUNK_SIZE);
-        const partialDir = path_1.default.join(job.extractedPath, "partialGraphs");
         const MAX_DB_FILE_SIZE = 100 * 1024;
         const PARALLEL = 5;
         for (let i = 0; i < slice.length; i += PARALLEL) {
             const batch = slice.slice(i, i + PARALLEL);
-            const results = await Promise.all(batch.map(async (absPath, idx) => {
-                const index = cursor + i + idx;
-                const outputPath = path_1.default.join(partialDir, `${index}.json`);
-                if (fs_1.default.existsSync(outputPath))
-                    return null;
+            const results = await Promise.all(batch.map(async (absPath) => {
                 const relPath = path_1.default
                     .relative(path_1.default.join(job.extractedPath, "repo"), absPath)
                     .split(path_1.default.sep)
@@ -257,7 +304,7 @@ async function runJobStep(job) {
                 }
                 let graph = { nodes: [], edges: [] };
                 try {
-                    if (/\.(js|ts|jsx|tsx)$/.test(absPath)) {
+                    if (isGraphSupportedFile(absPath)) {
                         const result = await withTimeout((0, instrumentExecutionBabel_1.instrumentExecutionBabel)(content), 5000);
                         if ((result === null || result === void 0 ? void 0 : result.nodes) && (result === null || result === void 0 ? void 0 : result.edges)) {
                             graph = (0, normalizeGraphIds_1.normalizeGraphIds)(result, relPath);
@@ -265,15 +312,12 @@ async function runJobStep(job) {
                     }
                 }
                 catch { }
-                try {
-                    fs_1.default.writeFileSync(outputPath, JSON.stringify({ file: relPath, graph }));
-                }
-                catch { }
                 return {
                     relPath,
                     stat,
                     content,
                     absPath,
+                    graph,
                     functions: (fileMeta === null || fileMeta === void 0 ? void 0 : fileMeta.functions) || [],
                     classes: (fileMeta === null || fileMeta === void 0 ? void 0 : fileMeta.classes) || [],
                     imports: (fileMeta === null || fileMeta === void 0 ? void 0 : fileMeta.imports) || [],
@@ -293,7 +337,7 @@ async function runJobStep(job) {
                             path: r.relPath,
                             size: r.stat.size,
                             language: (0, language_1.detectLanguage)(r.relPath),
-                            isCode: /\.(js|ts|jsx|tsx)$/.test(r.absPath),
+                            isCode: isGraphSupportedFile(r.relPath),
                             content: r.stat.size <= MAX_DB_FILE_SIZE ? r.content : undefined,
                             functions: r.functions,
                             classes: r.classes,
@@ -308,61 +352,53 @@ async function runJobStep(job) {
             if (docs.length) {
                 await db.collection("project_files").bulkWrite(docs);
             }
+            const fileGraphDocs = results
+                .filter((r) => Boolean(r) && isGraphSupportedFile(r.relPath))
+                .map((r) => {
+                var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+                return ({
+                    filePath: r.relPath,
+                    nodes: (_b = (_a = r.graph) === null || _a === void 0 ? void 0 : _a.nodes) !== null && _b !== void 0 ? _b : [],
+                    edges: (_d = (_c = r.graph) === null || _c === void 0 ? void 0 : _c.edges) !== null && _d !== void 0 ? _d : [],
+                    meta: {
+                        file: r.relPath,
+                        nodeCount: (_g = (_f = (_e = r.graph) === null || _e === void 0 ? void 0 : _e.nodes) === null || _f === void 0 ? void 0 : _f.length) !== null && _g !== void 0 ? _g : 0,
+                        edgeCount: (_k = (_j = (_h = r.graph) === null || _h === void 0 ? void 0 : _h.edges) === null || _j === void 0 ? void 0 : _j.length) !== null && _k !== void 0 ? _k : 0,
+                        mode: "execution",
+                        generatedAt: new Date(),
+                    },
+                });
+            });
+            if (fileGraphDocs.length) {
+                await (0, graphStore_1.saveFileGraphs)(job.projectId, fileGraphDocs, job.ownerId);
+            }
         }
         const newCursor = Math.min(cursor + CHUNK_SIZE, files.length);
         const total = files.length;
-        const progress = Math.round((newCursor / total) * 60);
+        const progress = total === 0 ? 60 : Math.round((newCursor / total) * 60);
+        if (newCursor >= total) {
+            const activeFilePaths = files
+                .map((absPath) => path_1.default
+                .relative(path_1.default.join(job.extractedPath, "repo"), absPath)
+                .split(path_1.default.sep)
+                .join("/"))
+                .filter(isGraphSupportedFile);
+            await (0, graphStore_1.deleteStaleFileGraphs)(job.projectId, activeFilePaths, job.ownerId);
+        }
         await (0, jobStore_1.saveJob)({
             id: job.id,
             cursor: newCursor,
             progress,
-            step: newCursor >= total ? "merge" : "file-analysis",
+            step: newCursor >= total ? "enrich" : "file-analysis",
             message: `Analyzed ${newCursor}/${total}`,
         });
         return;
     }
-    if (job.step === "merge") {
-        const mergedPath = path_1.default.join(job.extractedPath, "merged.json");
-        if (fs_1.default.existsSync(mergedPath)) {
-            await (0, jobStore_1.saveJob)({
-                ...job,
-                step: "enrich",
-                progress: 70,
-                message: "Merged graphs (cached)",
-            });
-            return;
-        }
-        const partialDir = path_1.default.join(job.extractedPath, "partialGraphs");
-        const files = fs_1.default
-            .readdirSync(partialDir)
-            .sort((a, b) => Number(a.split(".")[0]) - Number(b.split(".")[0]));
-        const fileGraphs = files
-            .map((f) => {
-            try {
-                return JSON.parse(fs_1.default.readFileSync(path_1.default.join(partialDir, f), "utf-8"));
-            }
-            catch {
-                return null;
-            }
-        })
-            .filter(Boolean);
-        const merged = (0, mergeFileGraph_1.mergeFileGraphs)(fileGraphs);
-        fs_1.default.writeFileSync(path_1.default.join(job.extractedPath, "merged.json"), JSON.stringify(merged));
-        await (0, jobStore_1.saveJob)({
-            ...job,
-            step: "enrich",
-            progress: 70,
-            message: "Merged graphs",
-        });
-        return;
-    }
     if (job.step === "enrich") {
-        const merged = JSON.parse(fs_1.default.readFileSync(path_1.default.join(job.extractedPath, "merged.json"), "utf-8"));
-        const client = await mongoClient_1.default;
-        const db = client.db();
-        const project = await db
-            .collection("projects")
-            .findOne({ projectId: job.projectId, members: job.ownerId });
+        const project = await db.collection("projects").findOne({
+            projectId: job.projectId,
+            members: job.ownerId,
+        });
         const fileTree = (project === null || project === void 0 ? void 0 : project.fileTree) || [];
         const resolverConfig = (_b = project === null || project === void 0 ? void 0 : project.resolverConfig) !== null && _b !== void 0 ? _b : {};
         (0, buildCrossFileImpactMap_1.attachCrossFileImpact)(fileTree, resolverConfig);
@@ -374,95 +410,117 @@ async function runJobStep(job) {
                 fileTree,
             },
         });
-        const withDeps = (0, injectFileDependencyEdges_1.injectFileDependencyEdges)(merged, fileTree);
-        const enriched = (0, enrichGraphSemantics_1.enrichGraphSemantics)(withDeps);
-        const styled = {
-            ...enriched,
-            edges: (0, styleGraphEdges_1.styleGraphEdges)(enriched.edges),
-        };
-        const entryPaths = new Set();
-        const candidatePaths = new Set();
-        const collectAnalysisRoots = (nodes) => {
-            var _a, _b;
-            for (const node of nodes) {
-                if (node.type === "file" && node.fullPath) {
-                    if (((_a = node.entry) === null || _a === void 0 ? void 0 : _a.isLikelyEntry) && ((_b = node.entry) === null || _b === void 0 ? void 0 : _b.kind) !== "cli") {
-                        entryPaths.add(node.fullPath);
-                    }
-                    if ((0, fileRoleClassifier_1.isDeadFileCandidateRole)(node.role)) {
-                        candidatePaths.add(node.fullPath);
-                    }
-                }
-                if (Array.isArray(node.children)) {
-                    collectAnalysisRoots(node.children);
-                }
-            }
-        };
-        collectAnalysisRoots(fileTree);
-        const entryFileIds = new Set(styled.nodes
-            .filter((node) => node.type === "file" &&
-            typeof node.file === "string" &&
-            entryPaths.has(node.file))
-            .map((node) => node.id));
-        const candidateFileIds = new Set(styled.nodes
-            .filter((node) => node.type === "file" &&
-            typeof node.file === "string" &&
-            candidatePaths.has(node.file))
-            .map((node) => node.id));
-        const deadFiles = (0, impactEngine_1.findDeadFiles)(styled, {
+        const storedFileGraphs = await (0, graphStore_1.getFileGraphs)(job.projectId, job.ownerId);
+        const fileGraphs = storedFileGraphs.map((doc) => {
+            var _a, _b, _c;
+            return ({
+                file: doc.filePath,
+                graph: {
+                    nodes: (_a = doc.nodes) !== null && _a !== void 0 ? _a : [],
+                    edges: (_b = doc.edges) !== null && _b !== void 0 ? _b : [],
+                    meta: (_c = doc.meta) !== null && _c !== void 0 ? _c : {},
+                },
+            });
+        });
+        console.log("[enrich] Loaded file graphs:", {
+            files: fileGraphs.length,
+        });
+        const { dependencies, missingNodes } = (0, fileDependecies_1.collectFileDependencies)(fileTree);
+        console.log("[enrich] Project dependencies:", {
+            dependencies: dependencies.length,
+            missingNodes: missingNodes.length,
+        });
+        const summaries = (0, fileGraphSummary_1.summarizeFileGraphs)(fileGraphs);
+        const summariesByFile = new Map(summaries.map((summary) => [summary.file, summary]));
+        const { fileIds } = collectFileUniverse(fileTree);
+        const { maxDegree, degrees } = (0, enrichFileGraphSemantics_1.calculateProjectDegrees)(fileGraphs);
+        console.log("[enrich] Execution degree summary:", {
+            maxDegree,
+            degreeNodes: degrees.size,
+        });
+        const { maxDegree: maxFileDegree, metrics: fileConnectivityMetrics } = (0, enrichFileGraphSemantics_1.calculateFileConnectivityMetrics)(dependencies, fileIds);
+        console.log("[enrich] File connectivity summary:", {
+            maxFileDegree,
+            files: fileConnectivityMetrics.length,
+        });
+        const { entryFileIds, candidateFileIds } = collectFileAnalysisScopes(fileTree);
+        const distributedCircularDeps = (0, distributedImpactEngine_1.findCircularFileDependencies)(dependencies, fileIds);
+        const distributedDeadFiles = (0, distributedImpactEngine_1.findDeadFilesDistributed)({
+            fileIds,
             entryFileIds,
             candidateFileIds,
+            dependencies,
         });
-        const circularDeps = (0, impactEngine_1.findCircularDependencies)(styled);
-        const importanceRanking = (0, impactEngine_1.computeFileImportance)(styled).slice(0, 20);
-        const finalGraph = {
-            ...styled,
-            meta: {
-                nodeCount: styled.nodes.length,
-                edgeCount: styled.edges.length,
-                mode: "execution",
-                intelligence: {
-                    deadFiles,
-                    circularDependencies: circularDeps,
-                    importanceRanking,
-                },
-                generatedAt: new Date(),
+        const distributedImportance = (0, distributedImpactEngine_1.computeFileImportanceDistributed)({
+            fileIds,
+            dependencies,
+            apiCounts: new Map(),
+        }).slice(0, 20);
+        const executionNodeCount = fileGraphs.reduce((total, { graph }) => { var _a, _b; return total + ((_b = (_a = graph.nodes) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0); }, 0);
+        const executionEdgeCount = fileGraphs.reduce((total, { graph }) => { var _a, _b; return total + ((_b = (_a = graph.edges) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0); }, 0);
+        const dependencyCount = dependencies.filter((dependency) => dependency.label === "imports").length;
+        const dependencyAnalysis = {
+            version: 2,
+            generatedAt: new Date(),
+            stats: {
+                fileCount: fileIds.size,
+                executionNodeCount,
+                executionEdgeCount,
+                dependencyCount,
+                missingDependencyCount: missingNodes.length,
+            },
+            fileMetrics: fileConnectivityMetrics,
+            intelligence: {
+                deadFiles: distributedDeadFiles,
+                circularDependencies: distributedCircularDeps,
+                importanceRanking: distributedImportance,
             },
         };
-        fs_1.default.writeFileSync(path_1.default.join(job.extractedPath, "final.json"), JSON.stringify(finalGraph));
+        const enrichedFileGraphs = fileGraphs.map(({ file, graph }) => {
+            var _a, _b, _c;
+            const summary = summariesByFile.get(file);
+            const enriched = (0, enrichFileGraphSemantics_1.enrichFileGraphSemantics)(graph, maxDegree, degrees, file, (_a = summary === null || summary === void 0 ? void 0 : summary.entryNodeIds) !== null && _a !== void 0 ? _a : []);
+            return {
+                filePath: file,
+                nodes: enriched.nodes,
+                edges: enriched.edges,
+                meta: {
+                    ...(graph.meta || {}),
+                    ...(enriched.meta || {}),
+                    nodeCount: enriched.nodes.length,
+                    edgeCount: enriched.edges.length,
+                    mode: (_c = (_b = graph.meta) === null || _b === void 0 ? void 0 : _b.mode) !== null && _c !== void 0 ? _c : "execution",
+                    generatedAt: new Date(),
+                },
+            };
+        });
+        if (enrichedFileGraphs.length) {
+            await (0, graphStore_1.saveFileGraphs)(job.projectId, enrichedFileGraphs, job.ownerId);
+        }
+        console.log("[enrich] Saved enriched file graphs:", {
+            files: enrichedFileGraphs.length,
+        });
+        await db.collection("projects").updateOne({
+            projectId: job.projectId,
+        }, {
+            $set: {
+                dependencyAnalysis,
+            },
+        });
+        console.log("[intelligence] Distributed:", {
+            deadFiles: distributedDeadFiles.length,
+            circularDependencies: distributedCircularDeps.length,
+            importanceRanking: distributedImportance.length,
+        });
         await (0, jobStore_1.saveJob)({
             ...job,
             step: "save",
             progress: 90,
-            message: "Enriched graph",
+            message: "Enriched file graphs",
         });
         return;
     }
     if (job.step === "save") {
-        const finalGraph = JSON.parse(fs_1.default.readFileSync(path_1.default.join(job.extractedPath, "final.json"), "utf-8"));
-        const existing = await db
-            .collection("graphs")
-            .findOne({ projectId: job.projectId });
-        if (existing) {
-            await (0, jobStore_1.saveJob)({
-                ...job,
-                status: "done",
-                step: "done",
-                progress: 100,
-                message: "Already processed",
-            });
-            return;
-        }
-        console.log("[save] Graph size:", {
-            nodes: finalGraph.nodes.length,
-            edges: finalGraph.edges.length,
-        });
-        const graphJson = JSON.stringify(finalGraph);
-        console.log("[save] Graph JSON size:", {
-            bytes: Buffer.byteLength(graphJson, "utf-8"),
-            mb: (Buffer.byteLength(graphJson, "utf-8") / 1024 / 1024).toFixed(2),
-        });
-        await (0, graphStore_1.saveGraph)(job.projectId, finalGraph, job.ownerId);
         await (0, jobStore_1.saveJob)({
             ...job,
             status: "done",

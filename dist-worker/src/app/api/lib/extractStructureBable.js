@@ -115,8 +115,11 @@ function createImportVisitor(ctx) {
                     });
                 }
             }
-            if ((0, types_1.isImportExpression)(node) && (0, types_1.isStringLiteral)(node.source)) {
-                const val = node.source.value;
+            if ((0, types_1.isCallExpression)(node) &&
+                node.callee.type === "Import" &&
+                node.arguments.length === 1 &&
+                (0, types_1.isStringLiteral)(node.arguments[0])) {
+                const val = node.arguments[0].value;
                 if (!ctx.seen.imports.has(val)) {
                     ctx.seen.imports.add(val);
                     ctx.imports.push({

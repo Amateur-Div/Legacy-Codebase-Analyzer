@@ -33,6 +33,12 @@ export type FlowNode = {
   meta?: Record<string, any>;
 };
 
+export type StoredFlowEdge = {
+  from: number;
+  to: number;
+  label?: string;
+};
+
 export type FlowEdge = {
   id: string;
   from: string;
@@ -40,7 +46,16 @@ export type FlowEdge = {
   label?: string;
 };
 
-export type GraphIntelligence = {
+export type FileConnectivityMetrics = {
+  fileId: string;
+  filePath: string;
+  inDegree: number;
+  outDegree: number;
+  totalDegree: number;
+  score: number;
+};
+
+export type DependencyIntelligence = {
   deadFiles: string[];
   circularDependencies: string[][];
   importanceRanking: {
@@ -49,27 +64,43 @@ export type GraphIntelligence = {
   }[];
 };
 
+export type DependencyAnalysisStats = {
+  fileCount: number;
+  executionNodeCount: number;
+  executionEdgeCount: number;
+  dependencyCount: number;
+  missingDependencyCount: number;
+};
+
+export type ProjectDependencyAnalysis = {
+  version: number;
+  generatedAt: Date;
+
+  stats: DependencyAnalysisStats;
+  fileMetrics: FileConnectivityMetrics[];
+
+  intelligence: DependencyIntelligence;
+};
+
 export type FlowGraphMeta = {
   file?: string;
+
+  layer?: string;
+
+  entryNodeIds?: string[];
+
   projectId?: string;
+
   nodeCount?: number;
   edgeCount?: number;
-  mode?: string | null;
+
+  mode?: "execution" | string | null;
+
   generatedAt?: Date;
-  intelligence?: GraphIntelligence;
 };
 
 export type FlowGraph = {
   nodes: FlowNode[];
   edges: FlowEdge[];
   meta?: FlowGraphMeta;
-};
-
-export type ProjectFlow = {
-  projectId: string;
-  version: string;
-  files: string[];
-  graph: FlowGraph;
-  stats?: Record<string, any>;
-  createdAt: string;
 };

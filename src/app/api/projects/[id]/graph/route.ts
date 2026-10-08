@@ -1,64 +1,119 @@
-import { getGraph } from "@/app/api/lib/graph/graphStore";
+import { getFileGraph } from "@/app/api/lib/graph/graphStore";
 import { authMiddleware } from "@/lib/auth-server";
-import clientPromise from "@/lib/mongoClient";
 import { NextRequest, NextResponse } from "next/server";
+
+function normalizeFilePath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+}
+
+function isValidFilePath(filePath: string): boolean {
+  if (!filePath) return false;
+
+  if (filePath.startsWith("/")) return false;
+
+  const segments = filePath.split("/");
+  if (segments.includes("..")) return false;
+
+  return true;
+}
 
 export async function GET(
   req: NextRequest,
-  context: { params: Promise<{ jobId: string }> },
+  context: {
+    params: Promise<{ id: string }>;
+  },
 ) {
-  let projectId = req.url.split("/")[5];
-
   try {
-    const token = req.headers.get("Authorization")?.split("Bearer ")[1];
+    const { id: projectId } = await context.params;
 
-    const { uid } = await authMiddleware(token);
-
-    if (!uid) {
-      return new NextResponse(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-      });
+    if (!projectId) {
+      return NextResponse.json(
+        { error: "Project ID is required" },
+        { status: 400 },
+      );
     }
 
-    // try {
-    //   await assertProjectAccess(projectId, uid, "viewer");
-    // } catch (error: any) {
-    //   return NextResponse.json(
-    //     { error: error.message },
-    //     { status: error.status || 403 }
-    //   );
-    // }
+    const rawFilePath = req.nextUrl.searchParams.get("filePath");
 
-    const graphs = await getGraph(projectId, uid);
-    return NextResponse.json({ projectId, graphs });
-  } catch (err: any) {
+    if (!rawFilePath) {
+      return NextResponse.json(
+        {
+          error: "filePath query parameter is required",
+        },
+        { status: 400 },
+      );
+    }
+
+    console.log("id : ", projectId);
+    console.log("File path : ", rawFilePath);
+
+    const filePath = normalizeFilePath(rawFilePath);
+
+    if (!isValidFilePath(filePath)) {
+      return NextResponse.json(
+        {
+          error: "Invalid filePath",
+        },
+        { status: 400 },
+      );
+    }
+
+    const authorization = req.headers.get("authorization");
+
+    const token = authorization?.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length).trim()
+      : null;
+
+    if (!token) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    let uid: string;
+
+    try {
+      const auth = await authMiddleware(token);
+
+      if (!auth?.uid) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      }
+
+      uid = auth.uid;
+    } catch {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const graph = await getFileGraph(projectId, filePath, uid);
+
+    if (!graph) {
+      return NextResponse.json(
+        {
+          error: "Graph not found for selected file",
+          projectId,
+          filePath,
+        },
+        { status: 404 },
+      );
+    }
+
     return NextResponse.json(
-      { error: String(err?.message ?? err) },
-      { status: 500 },
+      {
+        projectId,
+        filePath,
+        graph,
+      },
+      {
+        headers: {
+          "Cache-Control": "private, no-store",
+        },
+      },
     );
-  }
-}
+  } catch (err: any) {
+    console.error("[graph-api] Failed to load file graph:", err);
 
-export async function PUT(req: NextRequest) {
-  try {
-    const projectId = req.url.split("/")[5];
-
-    const client = await clientPromise;
-    const db = client.db();
-    const col = db.collection("graphs");
-
-    const body = await req.json();
-    const { nodes, edges } = body;
-
-    const graph = await col.find({ projectId }).toArray();
-    console.log("Graph : ", graph);
-
-    await col.updateOne({ projectId }, { $set: { record: body } });
-
-    return NextResponse.json({ message: "Graph updated successfully!" });
-  } catch (error: any) {
     return NextResponse.json(
-      { error: String(error?.message ?? error) },
+      {
+        error: String(err?.message ?? err),
+      },
       { status: 500 },
     );
   }

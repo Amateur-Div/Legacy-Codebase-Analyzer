@@ -1,26 +1,20 @@
 "use client";
 
-import React, { useEffect } from "react";
-import {
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  Badge,
-  BookText,
-  FileWarning,
-  FunctionSquare,
-  ListTodo,
-} from "lucide-react";
+import React from "react";
+import { Badge, BookText, FileWarning, ListTodo } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
 import { ImpactSummaryCard } from "./ImpactSummaryCard";
-import { FlowGraph } from "@/app/api/lib/analyzer/types";
+import { ProjectDependencyAnalysis } from "@/app/api/lib/analyzer/types";
 
 interface Props {
   selectedFileNode: any;
-  graphData: FlowGraph;
-  setSelectedPath: (path: string) => void;
+  dependencyAnalysis?: ProjectDependencyAnalysis;
+
+  fileTree: any;
+  onFileChange: (path: string) => void;
   setShowDocs: React.Dispatch<React.SetStateAction<boolean>>;
   showDocs: boolean;
   jumpToLine: (line: number) => void;
@@ -28,8 +22,9 @@ interface Props {
 
 export default function FileInsightsSidebar({
   selectedFileNode,
-  graphData,
-  setSelectedPath,
+  dependencyAnalysis,
+  fileTree,
+  onFileChange,
   setShowDocs,
   showDocs,
   jumpToLine,
@@ -37,17 +32,16 @@ export default function FileInsightsSidebar({
   return (
     <div className="w-full min-w-0 overflow-y-auto pr-1">
       <div className="space-y-4 pt-1">
-        {graphData.meta?.intelligence ? (
+        {dependencyAnalysis && (
           <div className="rounded-xl border bg-card p-3 sm:p-4">
-            <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
-              Impact Analysis
-            </h3>
             <ImpactSummaryCard
-              graph={graphData}
-              onFileChange={setSelectedPath}
+              dependencyAnalysis={dependencyAnalysis}
+              selectedFileNode={selectedFileNode}
+              fileTree={fileTree}
+              onFileChange={onFileChange}
             />
           </div>
-        ) : null}
+        )}
 
         {selectedFileNode?.language && (
           <>
@@ -237,7 +231,7 @@ export default function FileInsightsSidebar({
                     <li
                       key={imp}
                       className="cursor-pointer hover:text-gray-900 hover:underline"
-                      onClick={() => setSelectedPath(imp)}
+                      onClick={() => onFileChange(imp)}
                     >
                       {imp}
                     </li>
@@ -256,7 +250,7 @@ export default function FileInsightsSidebar({
                     <li
                       key={file}
                       className="cursor-pointer hover:text-gray-900 hover:underline"
-                      onClick={() => setSelectedPath(file)}
+                      onClick={() => onFileChange(file)}
                     >
                       {file}
                     </li>

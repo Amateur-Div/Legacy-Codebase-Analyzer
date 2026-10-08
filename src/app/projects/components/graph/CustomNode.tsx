@@ -42,14 +42,12 @@ export default function CustomNode({ data }: any) {
   const highlightOpacity = data?.fadedByHighlight ? 0.08 : 1;
   const deadOpacity = data?.fadedByDead ? 0.05 : 1;
   const functionFocusOpacity = data?.fadedByFunctionFocus ? 0.05 : 1;
-  const architectureOpacity = data?.architectureDeadOpacity ?? 1;
 
   const finalOpacity = Math.min(
     filterOpacity,
     highlightOpacity,
     deadOpacity,
     functionFocusOpacity,
-    architectureOpacity,
   );
 
   const isDead = data?.fadedByDead;

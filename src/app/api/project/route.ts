@@ -20,6 +20,8 @@ export async function GET(req: NextRequest) {
     if (!project)
       return NextResponse.json({ error: "Not found" }, { status: 404 });
 
+    console.log();
+
     return NextResponse.json({
       _id: project._id.toString(),
       projectName: project.projectName,
@@ -34,7 +36,7 @@ export async function GET(req: NextRequest) {
       tags: project.tags ?? [],
       jobId: project.jobId,
       analysisComplete: project.analysisComplete,
-      project,
+      dependencyAnalysis: project.dependencyAnalysis || {},
     });
   } catch (err) {
     console.error("PROJECT_FETCH_ERROR", err);

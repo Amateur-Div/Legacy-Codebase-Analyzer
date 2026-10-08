@@ -14,8 +14,6 @@ import {
   ExternalLink,
   Code2,
   MoreVertical,
-  Trash2,
-  Pencil,
   Clipboard,
   FileText,
   BookText,
@@ -28,46 +26,58 @@ import {
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
-import RenameFileDialog from "./FileRenameDialog";
 import { ObjectId } from "bson";
 import { getAuth } from "firebase/auth";
 import {
-  patchGraphOnFileDelete,
-  patchGraphOnFileRename,
-} from "@/app/api/lib/graph/graphPatcher";
-import { FlowGraph } from "@/app/api/lib/analyzer/types";
+  FlowGraph,
+  ProjectDependencyAnalysis,
+} from "@/app/api/lib/analyzer/types";
 import FlowVisualizer from "./FlowVisualizer";
 import FileInsightsSidebar from "./FileInsightsSidebar";
 import CodeEditorPanel from "./CodeEditorPanel";
 
 interface FileViewerPanelProps {
+  id: any;
   projectId: number | ObjectId;
   project: JSON | any;
+
+  fileTree: any;
   graphData: FlowGraph;
-  setGraphData: (data: FlowGraph) => void;
-  setProject: (data: JSON) => JSON | void;
+  setGraphData: any;
+  dependencyAnalysis?: ProjectDependencyAnalysis;
+
+  handleFileClick: (path: string) => void;
+
   selectedPath: string | null;
   setSelectedPath: (filePath: string | null) => string | void;
+
   fileContent: string;
-  fileTree: any[];
   selectedFileNode: any;
+
   lineNumber: number | null;
+
   readmeContent: string | null;
   readmeSummary: string | null;
-  getLanguageMeta: (filePath: string) => { name: string; color: string };
+
+  getLanguageMeta: (filePath: string) => {
+    name: string;
+    color: string;
+  };
 }
 
 export default function FileViewerPanel({
+  id,
   projectId,
   project,
   graphData,
+  handleFileClick,
+  fileTree,
   setGraphData,
-  setProject,
   selectedPath,
   setSelectedPath,
   fileContent,
-  fileTree,
   selectedFileNode,
+  dependencyAnalysis,
   lineNumber,
   readmeContent,
   readmeSummary,
@@ -78,7 +88,6 @@ export default function FileViewerPanel({
   const [searchTerm, setSearchTerm] = useState<any>("");
   const codeContainerRef = useRef<HTMLDivElement | null>(null);
   const [lastScrolledLine, setLastScrolledLine] = useState<number | null>(null);
-  const [renameInputOpen, setRenameInputOpen] = useState(false);
   const [showRawData, setShowRawData] = useState(false);
   const [hoveredLine, setHoveredLine] = useState<number | null>(null);
   const [hoveredLinePos, setHoveredLinePos] = useState<number | null>(null);
@@ -367,127 +376,6 @@ export default function FileViewerPanel({
     }, 1500);
   };
 
-  const removeFileFromTree = (nodes: any[], targetPath: string): any[] => {
-    return nodes
-      .filter((node) => node.fullPath !== targetPath)
-      .map((node) =>
-        node.children
-          ? { ...node, children: removeFileFromTree(node.children, targetPath) }
-          : node,
-      );
-  };
-
-  const handleDeleteFile = async () => {
-    const token = await getAuth().currentUser?.getIdToken();
-    const res = await fetch(`/api/project/file?projectId=${projectId}`, {
-      method: "DELETE",
-      body: JSON.stringify({ oldPath: selectedPath }),
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    const data = await res.json();
-    const oldPath = selectedPath;
-
-    if (data.success) {
-      toast.success("File deleted successfully", {
-        description: selectedPath?.split("\\").pop(),
-      });
-      setSelectedPath(null);
-
-      const filteredTree = removeFileFromTree(fileTree, selectedPath!);
-      setProject({
-        ...project,
-        fileTree: filteredTree,
-      });
-
-      const updatedGraph = patchGraphOnFileDelete(graphData, oldPath!);
-      setGraphData(updatedGraph);
-
-      await fetch(`/api/projects/${project.projectId}/graph`, {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          projectId: project.projectId,
-        },
-        body: JSON.stringify(updatedGraph),
-      });
-    } else {
-      toast.error("Error deleting file", {
-        description: data.error || "An error occured.",
-      });
-      console.log(data.error);
-    }
-  };
-
-  function updateFileTreeForRename(
-    nodes: any[],
-    oldPath: string,
-    newPath: string,
-  ): any {
-    return nodes.map((node) => {
-      if (node.fullPath === oldPath) {
-        return { ...node, name: newPath, fullPath: newPath };
-      }
-
-      if (node.children) {
-        return {
-          ...node,
-          children: updateFileTreeForRename(node.children, oldPath, newPath),
-        };
-      }
-
-      return node;
-    });
-  }
-
-  // TODO:- Refactor rename later.
-  // const handleRenameFile = async (oldPath: string, newName: string) => {
-  //   const token = await getAuth().currentUser?.getIdToken();
-  //   const res = await fetch(
-  //     `/api/project/file?projectId=${project.projectId}`,
-  //     {
-  //       method: "POST",
-  //       body: JSON.stringify({ oldPath, newName }),
-  //       headers: {
-  //         Authorization: `Bearer ${token}`,
-  //       },
-  //     },
-  //   );
-
-  //   const data = await res.json();
-
-  //   if (data.success) {
-  //     const ext = oldPath.split(".").pop();
-  //     const dir = selectedPath?.substring(0, oldPath.lastIndexOf("/"));
-
-  //     const updatedName = newName.endsWith(`.${ext}`)
-  //       ? newName
-  //       : `${newName}.${ext}`;
-  //     const newPath = `${dir}/${updatedName}`;
-
-  //     setSelectedPath(newPath);
-
-  //     const filteredTree = updateFileTreeForRename(fileTree, oldPath, newPath);
-  //     setProject({
-  //       ...project,
-  //       fileTree: filteredTree,
-  //     });
-
-  //     const updatedGraph = patchGraphOnFileRename(graphData, oldPath, newPath);
-  //     setGraphData(updatedGraph);
-
-  //     toast.success("File renamed.", {
-  //       description: `${newName}`,
-  //     });
-  //   } else {
-  //     toast.error("Rename failed.", {
-  //       description: data.error || "An error occured.",
-  //     });
-  //   }
-  // };
-
   const handleMouseEnterLine = (lineNumber: number, top: number) => {
     setHoveredLine((prev) => (prev === lineNumber ? prev : lineNumber));
     setHoveredLinePos(top);
@@ -609,23 +497,6 @@ export default function FileViewerPanel({
                             <Download size={14} />
                             Download Raw
                           </DropdownMenuItem>
-                          {/* TODO: add rename later after refactor */}
-                          {/* <DropdownMenuItem
-                            className="gap-2 cursor-pointer"
-                            onClick={() => {
-                              setRenameInputOpen(true);
-                            }}
-                          >
-                            <Pencil size={14} />
-                            Rename
-                          </DropdownMenuItem> */}
-                          <DropdownMenuItem
-                            className="gap-2 text-red-600 cursor-pointer"
-                            onClick={handleDeleteFile}
-                          >
-                            <Trash2 size={14} />
-                            Delete
-                          </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() => {
                               if (selectedPath) {
@@ -711,10 +582,11 @@ export default function FileViewerPanel({
                 <div className="min-h-0 h-full overflow-y-auto lg:min-w-0">
                   <FileInsightsSidebar
                     selectedFileNode={selectedFileNode}
-                    graphData={graphData}
-                    setSelectedPath={setSelectedPath}
-                    showDocs={showDocs}
+                    dependencyAnalysis={dependencyAnalysis}
+                    fileTree={fileTree}
+                    onFileChange={handleFileClick}
                     setShowDocs={setShowDocs}
+                    showDocs={showDocs}
                     jumpToLine={jumpToLine}
                   />
                 </div>
@@ -749,10 +621,10 @@ export default function FileViewerPanel({
             <>
               <div className="flex-1 overflow-hidden">
                 <FlowVisualizer
+                  selectedPath={selectedPath}
+                  id={id}
                   graphData={graphData}
-                  projectId={projectId}
                   setGraphData={setGraphData}
-                  id={project.projectId}
                   selectedFileNode={selectedFileNode}
                 />
               </div>

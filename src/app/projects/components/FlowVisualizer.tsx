@@ -1,3 +1,5 @@
+"use client";
+
 import React, {
   useCallback,
   useEffect,
@@ -5,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+
 import ReactFlow, {
   Background,
   Controls,
@@ -16,38 +19,34 @@ import ReactFlow, {
   OnInit,
   ReactFlowInstance,
 } from "reactflow";
+
 import "reactflow/dist/style.css";
+
 import { NODE_H, NODE_W, getDagreGraph } from "../utils/graphLayout";
-import { getAuth } from "firebase/auth";
 import { FlowGraph } from "@/app/api/lib/analyzer/types";
+
 import {
   collectReachable,
   normalizePath,
   normalizeType,
 } from "../utils/graphHelpers";
+
 import { typeColors } from "../utils/graphStyles";
 import CustomNode from "./graph/CustomNode";
 import { buildVisualNodes } from "../utils/buildVisualNodes";
 import GraphToolbar from "./graph/GraphToolbar";
+
 import { ChevronDown, ChevronUp, X } from "lucide-react";
+import { getAuth } from "firebase/auth";
 
 type GraphMode = "full" | "disabled";
 
 interface Props {
-  graphData: FlowGraph;
-  selectedFileNode: any;
-  setGraphData: (graphData: {
-    nodes: any[];
-    edges: any[];
-    meta: {
-      nodeCount: number;
-      edgeCount: number;
-      mode: string | null;
-      generatedAt: Date;
-    };
-  }) => void;
-  projectId: any;
+  selectedPath: string | null;
   id: any;
+  graphData: FlowGraph;
+  setGraphData: any;
+  selectedFileNode: any;
 }
 
 const nodeTypes: NodeTypes = {
@@ -68,58 +67,143 @@ const nodeTypes: NodeTypes = {
 };
 
 export default function FlowVisualizer({
-  graphData,
-  projectId,
-  setGraphData,
+  selectedPath,
   id,
+  graphData,
+  setGraphData,
   selectedFileNode,
 }: Props) {
   const [heatmapMode, setHeatmapMode] = useState<
     "none" | "complexity" | "importance"
   >("none");
+
   const [selectedNode, setSelectedNode] = useState<Node | null>(null);
   const [filterType, setFilterType] = useState<string | null>(null);
-  const [explanation, setExplanation] = useState<string | null>(null);
   const [showVisualizer, setShowVisualizer] = useState(true);
   const [hideDeadCode, setHideDeadCode] = useState(false);
-  const [showLegend, setShowLegend] = useState<boolean>(false);
-  const [nodeCount, setNodeCount] = useState(0);
-  const [edgeCount, setEdgeCount] = useState(0);
-  const [graphScope, setGraphScope] = useState<"file" | "global">("file");
+  const [showLegend, setShowLegend] = useState(false);
+
+  const rfInstanceRef = useRef<ReactFlowInstance | null>(null);
+
+  const selectedFile = selectedFileNode?.fullPath || null;
 
   useEffect(() => {
-    let mounted = true;
+    if (!id || !selectedPath) {
+      setGraphData({
+        nodes: [],
+        edges: [],
+      });
+      return;
+    }
+
+    const controller = new AbortController();
 
     const fetchGraphData = async () => {
       try {
         const token = await getAuth().currentUser?.getIdToken();
 
-        const res = await fetch(`/api/projects/${id}/graph`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
+        const res = await fetch(
+          `/api/projects/${id}/graph?filePath=${encodeURIComponent(
+            selectedPath,
+          )}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+            signal: controller.signal,
           },
-        });
+        );
 
         const data = await res.json();
 
-        if (!mounted) return;
+        if (!res.ok) {
+          throw new Error(data?.error ?? "Failed to load file graph.");
+        }
 
-        console.log(data.graphs?.[0]?.record);
+        if (!controller.signal.aborted) {
+          setGraphData(data?.graph ?? { nodes: [], edges: [] });
+        }
+      } catch (err: any) {
+        if (err?.name === "AbortError") return;
 
-        setGraphData(data.graphs?.[0]?.record);
-        setNodeCount(data.graphs?.[0]?.record?.meta?.nodeCount);
-        setEdgeCount(data.graphs?.[0]?.record?.meta?.edgeCount);
-      } catch (err) {
-        console.error("Failed to fetch graph", err);
+        console.error("Failed to load file graph:", err);
       }
     };
 
     fetchGraphData();
 
-    return () => {
-      mounted = false;
+    return () => controller.abort();
+  }, [id, selectedPath, setGraphData]);
+
+  useEffect(() => {
+    setSelectedNode(null);
+    setFilterType(null);
+  }, [selectedFile]);
+
+  const scopedGraph = useMemo(() => {
+    if (!selectedFile || !graphData?.nodes?.length) {
+      return {
+        nodes: [],
+        edges: [],
+      };
+    }
+
+    const normalizedSelectedFile = normalizePath(selectedFile);
+
+    const graphMetaFile = normalizePath(graphData.meta?.file);
+
+    const fileNodes = graphData.nodes.filter((node: any) => {
+      const nodeFile = normalizePath(node.file);
+
+      if (nodeFile === normalizedSelectedFile) {
+        return true;
+      }
+
+      if (!node.file && graphMetaFile === normalizedSelectedFile) {
+        return true;
+      }
+
+      return false;
+    });
+
+    const nodeIds = new Set(fileNodes.map((node: any) => node.id));
+
+    const fileEdges = (graphData.edges ?? []).filter(
+      (edge: any) => nodeIds.has(edge.from) && nodeIds.has(edge.to),
+    );
+
+    return {
+      nodes: fileNodes.map((node: any) => ({
+        id: node.id,
+        type: "custom",
+        position: { x: 0, y: 0 },
+        data: {
+          raw: node,
+        },
+        draggable: false,
+        sourcePosition: Position.Bottom,
+        targetPosition: Position.Top,
+      })),
+
+      edges: fileEdges.map((edge: any) => ({
+        id: edge.id,
+        source: edge.from,
+        target: edge.to,
+        label: edge.label,
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+        },
+      })),
     };
-  }, [id, setGraphData]);
+  }, [graphData, selectedFile]);
+
+  const nodeCount = scopedGraph.nodes.length;
+  const edgeCount = scopedGraph.edges.length;
+
+  const graphMode: GraphMode = useMemo(
+    () => (nodeCount > 1300 || edgeCount > 2500 ? "disabled" : "full"),
+    [nodeCount, edgeCount],
+  );
 
   const resetGraphState = useCallback(() => {
     setHeatmapMode("none");
@@ -127,19 +211,15 @@ export default function FlowVisualizer({
     setSelectedNode(null);
   }, []);
 
-  const graphMode: GraphMode = useMemo(
-    () => (nodeCount > 1300 || edgeCount > 2500 ? "disabled" : "full"),
-    [nodeCount, edgeCount],
-  );
-
   const focusedFunctionId = useMemo(() => {
     if (selectedNode && selectedNode.data?.raw?.type === "function") {
       return selectedNode.id;
     }
+
     return null;
   }, [selectedNode]);
 
-  const onNodeClick = useCallback((_: any, node: Node) => {
+  const onNodeClick = useCallback((_event: React.MouseEvent, node: Node) => {
     setSelectedNode(node);
   }, []);
 
@@ -147,296 +227,237 @@ export default function FlowVisualizer({
     setSelectedNode(null);
   }, []);
 
-  const colorBySemantic = (n: any) => {
-    const sem = n.semantic;
+  const colorBySemantic = useCallback(
+    (node: any) => {
+      const semantic = node.semantic ?? {};
 
-    if (heatmapMode === "complexity") {
-      const c = sem.complexity ?? 1;
-      if (c >= 8) return "#7f1d1d";
-      if (c >= 5) return "#c2410c";
-      if (c >= 3) return "#f59e0b";
-      return "#fde68a";
-    }
-    if (heatmapMode === "importance") {
-      const imp = sem.importance ?? 0;
-      if (imp > 0.75) return "#065f46";
-      if (imp > 0.4) return "#10b981";
-      if (imp > 0.15) return "#34d399";
-      return "#bbf7d0";
-    }
-    return typeColors[n.type] || "#fff";
-  };
+      if (heatmapMode === "complexity") {
+        const complexity = semantic.complexity ?? 1;
 
-  const selectedFile = selectedFileNode?.fullPath || null;
-  const isFileView = graphScope === "file";
+        if (complexity >= 8) return "#7f1d1d";
+        if (complexity >= 5) return "#c2410c";
+        if (complexity >= 3) return "#f59e0b";
 
-  const scopedGraph = useMemo(() => {
-    if (graphMode === "disabled") {
-      return { nodes: [], edges: [] };
-    }
+        return "#fde68a";
+      }
 
-    if (!graphData?.nodes) {
-      return { nodes: [], edges: [] };
-    }
+      if (heatmapMode === "importance") {
+        const importance = semantic.importance ?? 0;
 
-    if (isFileView) {
-      const fileNodes = graphData.nodes.filter(
-        (n: any) => normalizePath(n.file) === normalizePath(selectedFile),
-      );
+        if (importance > 0.75) return "#065f46";
+        if (importance > 0.4) return "#10b981";
+        if (importance > 0.15) return "#34d399";
 
-      const nodeIds = new Set(fileNodes.map((n: any) => n.id));
+        return "#bbf7d0";
+      }
 
-      const fileEdges = graphData.edges.filter(
-        (e: any) => nodeIds.has(e.from) && nodeIds.has(e.to),
-      );
-
-      return {
-        nodes: fileNodes.map((n: any) => ({
-          id: n.id,
-          type: "custom",
-          position: { x: 0, y: 0 },
-          data: { raw: n },
-          draggable: false,
-          sourcePosition: Position.Bottom,
-          targetPosition: Position.Top,
-        })),
-        edges: fileEdges.map((e: any) => ({
-          id: e.id,
-          source: e.from,
-          target: e.to,
-          label: e.label,
-          markerEnd: { type: MarkerType.ArrowClosed },
-        })),
-      };
-    }
-
-    const dependencyEdges = graphData.edges.filter(
-      (e) => e.label === "imports",
-    );
-
-    const connectedFileIds = new Set<string>();
-    dependencyEdges.forEach((e) => {
-      connectedFileIds.add(e.from);
-      connectedFileIds.add(e.to);
-    });
-
-    const structuralNodes = graphData.nodes.filter(
-      (n) => n.type === "file" && connectedFileIds.has(n.id),
-    );
-
-    const nodeIds = new Set(structuralNodes.map((n: any) => n.id));
-
-    const structuralEdges = graphData.edges.filter(
-      (e: any) => nodeIds.has(e.from) && nodeIds.has(e.to),
-    );
-
-    return {
-      nodes: structuralNodes.map((n: any) => ({
-        id: n.id,
-        type: "custom",
-        position: { x: 0, y: 0 },
-        data: { raw: n },
-        draggable: false,
-        sourcePosition: Position.Bottom,
-        targetPosition: Position.Top,
-      })),
-      edges: structuralEdges.map((e: any) => ({
-        id: e.id,
-        source: e.from,
-        target: e.to,
-        label: e.label,
-        markerEnd: { type: MarkerType.ArrowClosed },
-      })),
-    };
-  }, [graphData, graphScope, selectedFile, graphMode]);
+      return typeColors[node.type] || "#fff";
+    },
+    [heatmapMode],
+  );
 
   const layoutedGraph = useMemo(() => {
     if (graphMode !== "full") {
       return scopedGraph;
     }
-    if (!scopedGraph.nodes.length) return scopedGraph;
 
-    const g = getDagreGraph(scopedGraph.nodes, scopedGraph.edges, "TB");
+    if (!scopedGraph.nodes.length) {
+      return scopedGraph;
+    }
+
+    const graph = getDagreGraph(scopedGraph.nodes, scopedGraph.edges, "TB");
 
     return {
-      nodes: scopedGraph.nodes.map((n) => {
-        const p = g.node(n.id);
+      nodes: scopedGraph.nodes.map((node) => {
+        const position = graph.node(node.id);
+
+        if (!position) {
+          return node;
+        }
+
         return {
-          ...n,
-          position: { x: p.x - NODE_W / 2, y: p.y - NODE_H / 2 },
+          ...node,
+          position: {
+            x: position.x - NODE_W / 2,
+            y: position.y - NODE_H / 2,
+          },
         };
       }),
+
       edges: scopedGraph.edges,
     };
-  }, [scopedGraph]);
+  }, [scopedGraph, graphMode]);
 
   const adjacency = useMemo(() => {
     const forward = new Map<string, string[]>();
     const backward = new Map<string, string[]>();
 
-    for (const e of layoutedGraph.edges) {
-      if (!forward.has(e.source as string)) forward.set(e.source as string, []);
-      if (!backward.has(e.target as string))
-        backward.set(e.target as string, []);
+    for (const edge of layoutedGraph.edges) {
+      const source = String(edge.source);
+      const target = String(edge.target);
 
-      forward.get(e.source as string)!.push(e.target as string);
-      backward.get(e.target as string)!.push(e.source as string);
+      if (!forward.has(source)) {
+        forward.set(source, []);
+      }
+
+      if (!backward.has(target)) {
+        backward.set(target, []);
+      }
+
+      forward.get(source)!.push(target);
+      backward.get(target)!.push(source);
     }
 
-    return { forward, backward };
+    return {
+      forward,
+      backward,
+    };
   }, [layoutedGraph]);
 
   const functionFocusedNodes = useMemo(() => {
-    if (!focusedFunctionId) return null;
+    if (!focusedFunctionId) {
+      return null;
+    }
+
     return collectReachable(focusedFunctionId, adjacency.forward);
   }, [focusedFunctionId, adjacency]);
 
   const highlightedNodes = useMemo(() => {
-    if (!selectedNode) return null;
+    if (!selectedNode) {
+      return null;
+    }
 
     const forwardSet = collectReachable(selectedNode.id, adjacency.forward);
+
     const backwardSet = collectReachable(selectedNode.id, adjacency.backward);
 
     return new Set([...Array.from(forwardSet), ...Array.from(backwardSet)]);
   }, [selectedNode, adjacency]);
 
-  const circularSet = useMemo(
-    () =>
-      new Set(
-        graphData?.meta?.intelligence?.circularDependencies?.flat() || [],
-      ),
-    [graphData],
-  );
-
-  const maxFileImportance = useMemo(() => {
-    const values = (graphData?.nodes ?? [])
-      .filter((n) => n.type === "file")
-      .map((n) => n.semantic?.importance ?? 0);
-
-    return values.length ? Math.max(...values) : 0;
-  }, [graphData]);
-
   const visualNodes = useMemo(() => {
     return buildVisualNodes({
       nodes: layoutedGraph.nodes,
-      heatmapMode,
       filterType,
       selectedNode,
       highlightedNodes,
-      graphScope,
       hideDeadCode,
       functionFocusedNodes,
-      maxFileImportance,
-      circularSet,
       normalizeType,
       colorBySemantic,
     });
   }, [
     layoutedGraph,
-    heatmapMode,
     filterType,
     selectedNode,
     highlightedNodes,
-    graphScope,
     hideDeadCode,
     functionFocusedNodes,
-    maxFileImportance,
-    circularSet,
+    colorBySemantic,
   ]);
 
   const visualEdges = useMemo(() => {
     const hasSelection = !!selectedNode;
 
-    return layoutedGraph.edges.map((e) => {
-      const onPath =
+    return layoutedGraph.edges.map((edge) => {
+      const isOnPath =
         !hasSelection ||
         (highlightedNodes &&
-          highlightedNodes.has(e.source as string) &&
-          highlightedNodes.has(e.target as string));
+          highlightedNodes.has(String(edge.source)) &&
+          highlightedNodes.has(String(edge.target)));
 
       return {
-        ...e,
+        ...edge,
+
         style: {
-          stroke: onPath ? "#2563EB" : "#9CA3AF",
-          strokeWidth: onPath ? 2.5 : 1.2,
-          opacity: onPath ? 1 : 0.4,
+          stroke: isOnPath ? "#2563EB" : "#9CA3AF",
+          strokeWidth: isOnPath ? 2.5 : 1.2,
+          opacity: isOnPath ? 1 : 0.4,
         },
-        markerEnd: { type: MarkerType.ArrowClosed },
+
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+        },
       };
     });
   }, [layoutedGraph, highlightedNodes, selectedNode]);
-
-  const rfInstanceRef = useRef<ReactFlowInstance | null>(null);
 
   const onInit: OnInit = useCallback((instance: ReactFlowInstance) => {
     rfInstanceRef.current = instance;
 
     requestAnimationFrame(() => {
-      instance.fitView({ padding: 0.2 });
-    });
-  }, []);
-
-  const zoomToFit = useCallback(() => {
-    rfInstanceRef.current?.fitView({
-      padding: 0.2,
+      instance.fitView({
+        padding: 0.2,
+      });
     });
   }, []);
 
   useEffect(() => {
-    if (explanation) {
-      const el = document.getElementById("ai-explanation");
-      if (el) el.scrollIntoView({ behavior: "smooth" });
+    if (!rfInstanceRef.current || !visualNodes.length) {
+      return;
     }
-  }, [explanation]);
 
-  const [loadingExplain, setLoadingExplain] = useState(false);
-
-  async function explainNode(node: any) {
-    if (!node) return;
-    setLoadingExplain(true);
-    setExplanation(null);
-
-    try {
-      const code = node.data?.raw?.code || "";
-      const res = await fetch(`/api/projects/${projectId}/explain`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
+    requestAnimationFrame(() => {
+      rfInstanceRef.current?.fitView({
+        padding: 0.2,
       });
-      const data = await res.json();
-      setExplanation(data?.explanation || "No response");
-    } catch (err: any) {
-      setExplanation("⚠ Error while fetching explanation: " + err.message);
-    } finally {
-      setLoadingExplain(false);
-    }
-  }
+    });
+  }, [selectedFile, visualNodes.length]);
 
-  if (graphMode === "disabled") {
+  if (!selectedFileNode) {
     return (
-      <div className="p-6 rounded-xl border border-yellow-300 bg-yellow-50">
-        <h3 className="font-semibold text-yellow-800 mb-2">
-          ⚠ Execution graph disabled
-        </h3>
-
-        <p className="text-sm text-yellow-700">
-          This project contains <b>{nodeCount}</b> nodes and <b>{edgeCount}</b>{" "}
-          edges.
-        </p>
-
-        <p className="text-sm text-yellow-700 mt-2">
-          Rendering the full execution graph may freeze your browser. Use
-          file-level navigation and cross-file impact instead.
+      <div className="py-20 text-center">
+        <p className="text-sm text-muted-foreground">
+          Select a file to explore Code Flow Visualization.
         </p>
       </div>
     );
   }
 
-  if (!selectedFileNode) {
+  if (!graphData || !graphData.nodes?.length) {
     return (
-      <div>
-        <p className="text-muted-foreground text-sm text-center py-20">
-          Select a file to explore Code Flow Visualization.
+      <div className="rounded-xl border border-dashed p-6 text-center">
+        <p className="text-sm font-medium">
+          Execution graph is not available yet.
+        </p>
+
+        <p className="mt-1 text-xs text-muted-foreground">
+          Select another file or wait for the file-level graph to finish
+          loading.
+        </p>
+      </div>
+    );
+  }
+
+  if (!scopedGraph.nodes.length) {
+    return (
+      <div className="rounded-xl border border-dashed p-6 text-center">
+        <p className="text-sm font-medium">
+          No execution nodes found for this file.
+        </p>
+
+        <p className="mt-1 text-xs text-muted-foreground">
+          This file may not contain executable code or its graph may still be
+          loading.
+        </p>
+      </div>
+    );
+  }
+
+  if (graphMode === "disabled") {
+    return (
+      <div className="rounded-xl border border-yellow-300 bg-yellow-50 p-6">
+        <h3 className="mb-2 font-semibold text-yellow-800">
+          ⚠ Execution graph too large
+        </h3>
+
+        <p className="text-sm text-yellow-700">
+          This file contains <b>{nodeCount}</b> execution nodes and{" "}
+          <b>{edgeCount}</b> edges.
+        </p>
+
+        <p className="mt-2 text-sm text-yellow-700">
+          Rendering this file-level execution graph may freeze your browser. Use
+          Code Outline and Cross-File Impact for deeper navigation.
         </p>
       </div>
     );
@@ -445,36 +466,27 @@ export default function FlowVisualizer({
   return (
     <div className="mb-6">
       <div
-        className="flex items-center justify-between px-4 py-2 bg-gray-100 border border-gray-200 rounded-t-xl cursor-pointer select-none"
-        onClick={() => setShowVisualizer((v) => !v)}
+        className="flex cursor-pointer select-none items-center justify-between rounded-t-xl border border-gray-200 bg-gray-100 px-4 py-2"
+        onClick={() => setShowVisualizer((value) => !value)}
       >
-        <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-700">
           Code Flow Visualization
         </h2>
-        <span className="text-gray-500 text-sm">
+
+        <span className="text-sm text-gray-500">
           {showVisualizer ? <ChevronUp /> : <ChevronDown />}
         </span>
       </div>
+
       <div
-        className={`w-full transition-all duration-300 ease-in-out border-x border-b border-gray-200 rounded-b-xl overflow-hidden
-        ${
+        className={`w-full overflow-hidden rounded-b-xl border-x border-b border-gray-200 transition-all duration-300 ease-in-out ${
           showVisualizer
             ? "h-[65vh] sm:h-[70vh] md:h-[75vh] lg:h-[80vh] xl:h-[85vh]"
             : "h-0"
-        }
-      `}
+        }`}
       >
-        <div
-          style={{
-            width: "100%",
-            borderRadius: 8,
-            overflow: "hidden",
-          }}
-          className="bg-muted/20 flex flex-col h-full min-h-0"
-        >
+        <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg bg-muted/20">
           <GraphToolbar
-            graphScope={graphScope}
-            setGraphScope={setGraphScope}
             heatmapMode={heatmapMode}
             setHeatmapMode={setHeatmapMode}
             filterType={filterType}
@@ -486,19 +498,18 @@ export default function FlowVisualizer({
             resetGraphState={resetGraphState}
           />
 
-          <div
-            id="ai-explanation"
-            className="relative flex-1 min-h-0 w-full h-full overflow-hidden"
-          >
+          <div className="relative h-full min-h-0 w-full flex-1 overflow-hidden">
             <ReactFlow
               nodes={visualNodes}
               edges={visualEdges}
+              onInit={onInit}
               onNodeClick={onNodeClick}
               onPaneClick={onPaneClick}
               nodeTypes={nodeTypes}
               panOnScroll
               zoomOnPinch
               panOnDrag
+              fitView
               style={{
                 background: "hsl(var(--background))",
                 height: "100%",
@@ -506,126 +517,91 @@ export default function FlowVisualizer({
               }}
             >
               <Background color="#e0e0e0" gap={20} />
-              {graphMode === "full" && (
-                <MiniMap
-                  nodeColor={(n: Node) => (n.data?.color as string) || "#ccc"}
-                  style={{
-                    borderRadius: 12,
-                    boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
-                  }}
-                  zoomable
-                  pannable
-                  maskColor="rgba(0, 0, 0,.08)"
-                />
-              )}
+
+              <MiniMap
+                nodeColor={(node: Node) =>
+                  (node.data?.color as string) || "#ccc"
+                }
+                style={{
+                  borderRadius: 12,
+                  boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
+                }}
+                zoomable
+                pannable
+                maskColor="rgba(0, 0, 0, .08)"
+              />
+
               <Controls showInteractive={false} position="bottom-left" />
             </ReactFlow>
 
             {showLegend && (
-              <div className="absolute z-50 right-3 top-3 w-[min(260px,calc(100%-24px))] max-h-[calc(100%-24px)] overflow-y-auto rounded-xl border bg-white p-3 text-xs text-gray-700 shadow-xl">
+              <div className="absolute right-3 top-3 z-50 max-h-[calc(100%-24px)] w-[min(260px,calc(100%-24px))] overflow-y-auto rounded-xl border bg-white p-3 text-xs text-gray-700 shadow-xl">
                 <div className="flex items-center justify-between border-b pb-3">
-                  <h3 className="font-semibold text-sm">Graph Legend</h3>
+                  <h3 className="text-sm font-semibold">Graph Legend</h3>
 
                   <button
+                    type="button"
                     onClick={() => setShowLegend(false)}
-                    className="
-                    rounded-md
-                    p-1
-                    text-muted-foreground
-                    hover:bg-muted
-                    hover:text-foreground
-                    transition-colors
-                    "
+                    className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    aria-label="Close graph legend"
                   >
                     <X size={16} />
                   </button>
                 </div>
 
-                <div style={{ marginTop: 8 }}>
+                <div className="mt-2 space-y-2">
                   <div className="flex items-center gap-2">
                     <div className="size-3 rounded-full bg-green-500" />
-                    <span>Function</span>— entry & body
+                    <span>Function</span>
+                    <span>— entry & body</span>
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <div className="size-3 rounded-full bg-blue-500" />
-                      <span>If / Branch</span>— conditional paths
-                    </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full bg-blue-500" />
+                    <span>If / Branch</span>
+                    <span>— conditional paths</span>
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <div className="size-3 rounded-full bg-purple-500" />
-                      <span>Loop</span>— iterative flow
-                    </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full bg-purple-500" />
+                    <span>Loop</span>
+                    <span>— iterative flow</span>
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <div className="size-3 rounded-full bg-white border border-gray-300" />
-                      <span>Statement</span> — linear execution
-                    </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="size-3 rounded-full border border-gray-300 bg-white" />
+                    <span>Statement</span>
+                    <span>— linear execution</span>
                   </div>
                 </div>
 
-                <hr style={{ margin: "8px 0" }} />
+                <hr className="my-2" />
 
                 <div>
-                  <div>
-                    <b>Heatmap</b>
-                  </div>
+                  <b>Heatmap</b>
                   <div>• Darker = higher complexity / importance</div>
                 </div>
 
-                <hr style={{ margin: "8px 0" }} />
+                <hr className="my-2" />
 
                 <div>
-                  <div>
-                    <b>Faded nodes</b>
-                  </div>
+                  <b>Faded nodes</b>
                   <div>• Filtered out</div>
                   <div>• Dead / unreachable</div>
                   <div>• Outside execution path</div>
                 </div>
 
-                <hr style={{ margin: "8px 0" }} />
+                <hr className="my-2" />
 
                 <div>
-                  <div>
-                    <b>Edges</b>
-                  </div>
+                  <b>Edges</b>
                   <div>• Solid → execution order</div>
                   <div>• Branch → true / false</div>
                   <div>• Loop-back → iteration</div>
                 </div>
               </div>
             )}
-
-            {/* <button
-              onClick={zoomToFit}
-              style={{
-                position: "absolute",
-                bottom: 24,
-                right: 24,
-                background: "#2563EB",
-                color: "white",
-                border: "none",
-                borderRadius: "50%",
-                width: 44,
-                height: 44,
-                cursor: "pointer",
-                boxShadow: "0 3px 8px rgba(0,0,0,0.25)",
-                fontSize: 20,
-              }}
-            >
-              ⤢
-            </button> */}
           </div>
-
-          {/* <GraphInspectorPanel
-            selectedNode={selectedNode}
-            explanation={explanation}
-            loadingExplain={loadingExplain}
-            explainNode={explainNode}
-          /> */}
         </div>
       </div>
     </div>
