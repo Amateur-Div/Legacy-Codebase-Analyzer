@@ -9,7 +9,7 @@ import {
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
   const filePath = req.nextUrl.searchParams.get("path");

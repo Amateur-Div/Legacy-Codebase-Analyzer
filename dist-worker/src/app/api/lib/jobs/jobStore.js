@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.saveJob = saveJob;
+exports.saveJobLifecycle = saveJobLifecycle;
 exports.loadJob = loadJob;
 exports.loadJobForOwner = loadJobForOwner;
 exports.listJobs = listJobs;
@@ -16,6 +17,18 @@ async function saveJob(job) {
     const collection = db.collection(COLLECTION);
     const { id, ...updates } = job;
     await collection.updateOne({ id }, { $set: updates }, { upsert: true });
+}
+async function saveJobLifecycle(job) {
+    const db = (await mongoClient_1.default).db();
+    const collection = db.collection(COLLECTION);
+    const { id, ...updates } = job;
+    const result = await collection.updateOne({
+        id,
+        status: { $nin: ["done", "cancelled"] },
+    }, {
+        $set: updates,
+    });
+    return result.modifiedCount === 1;
 }
 async function loadJob(jobId) {
     const db = (await mongoClient_1.default).db();

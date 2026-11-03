@@ -1,6 +1,4 @@
-import fs from "fs";
 import path from "path";
-import AdmZip from "adm-zip";
 import clientPromise from "../../../../lib/mongoClient";
 import { saveJob } from "./jobStore";
 import { instrumentExecutionBabel } from "../instrumentExecutionBabel";
@@ -17,12 +15,6 @@ import {
   calculateRepositoryInsights,
   detectTags,
 } from "../uploadHelpers";
-import {
-  cleanOldCache,
-  ensureCacheRoot,
-  getProjectCachePath,
-  touchCache,
-} from "../cache/extractCache";
 import {
   createModuleResolverConfig,
   type ModuleResolverConfig,
@@ -41,6 +33,8 @@ import {
   enrichFileGraphSemantics,
 } from "../analyzer/enrichFileGraphSemantics";
 import { ProjectDependencyAnalysis } from "../analyzer/types";
+import { downloadRepositoryArchive } from "./repositoryArchive";
+import { createRepositoryReader, RepositoryReader } from "./repositoryReader";
 
 const CHUNK_SIZE = 50;
 
@@ -65,26 +59,67 @@ const IGNORE_DIRS = new Set([
   ".cache",
 ]);
 
-function walkDir(root: string): string[] {
-  const results: string[] = [];
+interface ActiveRepository {
+  reader: RepositoryReader;
+  cleanupArchive: () => Promise<void>;
+}
 
-  function walk(dir: string) {
-    for (const item of fs.readdirSync(dir)) {
-      if (IGNORE_DIRS.has(item)) continue;
+const activeRepositories = new Map<string, ActiveRepository>();
 
-      const full = path.join(dir, item);
-      const stat = fs.statSync(full);
+async function getRepositoryReader(
+  job: any,
+  db: any,
+): Promise<RepositoryReader> {
+  const existing = activeRepositories.get(job.id);
 
-      if (stat.isDirectory()) {
-        walk(full);
-      } else {
-        results.push(full);
-      }
-    }
+  if (existing) {
+    return existing.reader;
   }
 
-  walk(root);
-  return results;
+  const project = await db.collection("projects").findOne({
+    projectId: job.projectId,
+  });
+
+  const blobPathname = project?.blobPathname;
+
+  if (
+    typeof blobPathname !== "string" ||
+    !blobPathname.startsWith("repository-uploads/")
+  ) {
+    throw new Error("Project repository Blob pathname is missing");
+  }
+
+  const archiveBuffer = await downloadRepositoryArchive(blobPathname);
+
+  try {
+    const reader = await createRepositoryReader(archiveBuffer, {
+      ignoredDirectories: IGNORE_DIRS,
+    });
+
+    activeRepositories.set(job.id, {
+      reader,
+      cleanupArchive: async () => {},
+    });
+
+    return reader;
+  } catch (error) {
+    archiveBuffer.fill(0);
+    throw error;
+  }
+}
+
+export async function cleanupRepositoryReader(jobId: string): Promise<void> {
+  const active = activeRepositories.get(jobId);
+
+  if (!active) return;
+
+  activeRepositories.delete(jobId);
+
+  try {
+    await active.reader.close();
+  } finally {
+    await active.cleanupArchive();
+  }
 }
 
 function withTimeout(promise: any, ms = 5000) {
@@ -165,70 +200,26 @@ export async function runJobStep(job: any) {
 
   const db = (await clientPromise).db();
 
-  if (!job.extractedPath) {
-    const project = await db
-      .collection("projects")
-      .findOne({ projectId: job.projectId });
-
-    ensureCacheRoot();
-
-    const root = getProjectCachePath(job.projectId);
-
-    fs.mkdirSync(root, { recursive: true });
-
-    const extractRoot = path.join(root, "repo");
-
-    touchCache(job.projectId);
-
-    fs.mkdirSync(extractRoot, { recursive: true });
-
-    const zipPath = project?.uploadPath;
-
-    let lastSize = -1;
-    let stableCount = 0;
-
-    for (let i = 0; i < 60; i++) {
-      if (zipPath && fs.existsSync(zipPath)) {
-        const size = fs.statSync(zipPath).size;
-
-        if (size === lastSize) {
-          stableCount++;
-
-          if (stableCount >= 3) break;
-        } else {
-          stableCount = 0;
-          lastSize = size;
-        }
-      }
-
-      await new Promise((r) => setTimeout(r, 500));
-    }
-
-    if (!zipPath || !fs.existsSync(zipPath)) {
-      throw new Error("zip not ready");
-    }
-
-    new AdmZip(zipPath).extractAllTo(extractRoot, true);
-
-    cleanOldCache();
+  if (job.step === "initializing" || !job.step) {
+    const reader = await getRepositoryReader(job, db);
 
     await saveJob({
       id: job.id,
-      extractedPath: root,
       step: "scan",
       status: "running",
       progress: 2,
-      message: "Repository extracted",
+      totalFiles: reader.files.length,
+      message: "Repository archive ready",
     });
 
     return;
   }
 
   if (job.step === "scan") {
-    const root = path.join(job.extractedPath, "repo");
+    const reader = await getRepositoryReader(job, db);
 
     if (!job.scanFiles) {
-      const scanFiles = walkDir(root);
+      const scanFiles = reader.files;
 
       await saveJob({
         id: job.id,
@@ -253,16 +244,16 @@ export async function runJobStep(job: any) {
   }
 
   if (job.step === "metadata") {
-    const root = path.join(job.extractedPath, "repo");
+    const reader = await getRepositoryReader(job, db);
 
-    const allFiles = job.scanFiles.map((abs: string) =>
-      path.relative(root, abs).split(path.sep).join("/"),
-    );
+    const allFiles: string[] = job.scanFiles || [];
 
     let resolverConfig: ModuleResolverConfig = {
       baseUrl: "",
       paths: [],
     };
+
+    const MAX_METADATA_FILE_BYTES = 1024 * 1024;
 
     const tsconfigPath = allFiles.find(
       (file: string) =>
@@ -271,43 +262,66 @@ export async function runJobStep(job: any) {
 
     if (tsconfigPath) {
       try {
-        const abs = path.join(root, tsconfigPath);
-        const parsed = JSON.parse(fs.readFileSync(abs, "utf-8"));
+        const result = await reader.readFile(
+          tsconfigPath,
+          MAX_METADATA_FILE_BYTES,
+        );
 
-        resolverConfig = createModuleResolverConfig(parsed);
-      } catch {}
+        if (result.buffer) {
+          const parsed = JSON.parse(result.buffer.toString("utf-8"));
+          resolverConfig = createModuleResolverConfig(parsed);
+        }
+      } catch (error) {
+        console.warn("[metadata] Unable to parse tsconfig.json:", error);
+      }
     }
 
-    const fileTree = await buildFileTree(allFiles, root);
+    const fileTree = await buildFileTree(
+      allFiles,
+      async (relativePath, maxBytes) => {
+        return reader.readFile(relativePath, maxBytes);
+      },
+    );
+
     const insights = calculateRepositoryInsights(fileTree);
 
     let packageInfo = null;
 
-    const pkgPath = allFiles.find((f: string) => f.endsWith("package.json"));
+    const pkgPath = allFiles.find((file: string) =>
+      file.endsWith("package.json"),
+    );
 
     if (pkgPath) {
       try {
-        const abs = path.join(root, pkgPath);
-        const parsed = JSON.parse(fs.readFileSync(abs, "utf-8"));
+        const result = await reader.readFile(pkgPath, MAX_METADATA_FILE_BYTES);
 
-        packageInfo = {
-          name: parsed.name,
-          version: parsed.version,
-          scripts: parsed.scripts || {},
-          dependencies: parsed.dependencies || {},
-          devDependencies: parsed.devDependencies || {},
-        };
-      } catch {}
+        if (result.buffer) {
+          const parsed = JSON.parse(result.buffer.toString("utf-8"));
+
+          packageInfo = {
+            name: parsed.name,
+            version: parsed.version,
+            scripts: parsed.scripts || {},
+            dependencies: parsed.dependencies || {},
+            devDependencies: parsed.devDependencies || {},
+          };
+        }
+      } catch (error) {
+        console.warn("[metadata] Unable to parse package.json:", error);
+      }
     }
 
     const entryPoints: string[] = [];
 
     const walkTree = (nodes: any[]) => {
-      for (const n of nodes) {
-        if (n.type === "file" && n.entry.isLikelyEntry) {
-          entryPoints.push(n.fullPath);
+      for (const node of nodes) {
+        if (node.type === "file" && node.entry?.isLikelyEntry) {
+          entryPoints.push(node.fullPath);
         }
-        if (n.children) walkTree(n.children);
+
+        if (node.children) {
+          walkTree(node.children);
+        }
       }
     };
 
@@ -341,9 +355,11 @@ export async function runJobStep(job: any) {
   }
 
   if (job.step === "file-analysis") {
-    const cursor = job.cursor ?? 0;
+    const reader = await getRepositoryReader(job, db);
 
-    const files = job.scanFiles || [];
+    const cursor = job.cursor ?? 0;
+    const files: string[] = job.scanFiles || [];
+
     const project = await db.collection("projects").findOne({
       projectId: job.projectId,
     });
@@ -374,40 +390,43 @@ export async function runJobStep(job: any) {
 
     const slice = files.slice(cursor, cursor + CHUNK_SIZE);
     const MAX_DB_FILE_SIZE = 100 * 1024;
+    const MAX_ANALYSIS_FILE_BYTES = 1024 * 1024;
     const PARALLEL = 5;
 
     for (let i = 0; i < slice.length; i += PARALLEL) {
       const batch = slice.slice(i, i + PARALLEL);
 
       const results = await Promise.all(
-        batch.map(async (absPath: any) => {
-          const relPath = path
-            .relative(path.join(job.extractedPath, "repo"), absPath)
-            .split(path.sep)
-            .join("/");
-
+        batch.map(async (relPath: string) => {
           const fileMeta = fileMetadataMap.get(relPath);
 
           let content = "";
+          let size = 0;
 
           try {
-            const buf = fs.readFileSync(absPath);
-            if (!isBinaryFile(buf)) {
-              content = buf.toString("utf-8");
+            const result = await reader.readFile(
+              relPath,
+              MAX_ANALYSIS_FILE_BYTES,
+            );
+
+            size = result.size;
+
+            if (result.buffer && !isBinaryFile(result.buffer)) {
+              content = result.buffer.toString("utf-8");
             }
-          } catch {}
-
-          let stat;
-          try {
-            stat = fs.statSync(absPath);
-          } catch {
+          } catch (error) {
+            console.warn(
+              "[file-analysis] Unable to read file:",
+              relPath,
+              error,
+            );
             return null;
           }
 
           let graph: any = { nodes: [], edges: [] };
 
           try {
-            if (isGraphSupportedFile(absPath)) {
+            if (isGraphSupportedFile(relPath) && content) {
               const result = await withTimeout(
                 instrumentExecutionBabel(content),
                 5000,
@@ -421,9 +440,8 @@ export async function runJobStep(job: any) {
 
           return {
             relPath,
-            stat,
+            size,
             content,
-            absPath,
             graph,
             functions: fileMeta?.functions || [],
             classes: fileMeta?.classes || [],
@@ -444,10 +462,10 @@ export async function runJobStep(job: any) {
             $set: {
               projectId: job.projectId,
               path: r.relPath,
-              size: r.stat.size,
+              size: r.size,
               language: detectLanguage(r.relPath),
               isCode: isGraphSupportedFile(r.relPath),
-              content: r.stat.size <= MAX_DB_FILE_SIZE ? r.content : undefined,
+              content: r.size <= MAX_DB_FILE_SIZE ? r.content : undefined,
               functions: r.functions,
               classes: r.classes,
               imports: r.imports,
@@ -492,15 +510,7 @@ export async function runJobStep(job: any) {
     const progress = total === 0 ? 60 : Math.round((newCursor / total) * 60);
 
     if (newCursor >= total) {
-      const activeFilePaths = files
-        .map((absPath: string) =>
-          path
-            .relative(path.join(job.extractedPath, "repo"), absPath)
-            .split(path.sep)
-            .join("/"),
-        )
-        .filter(isGraphSupportedFile);
-
+      const activeFilePaths = files.filter(isGraphSupportedFile);
       await deleteStaleFileGraphs(job.projectId, activeFilePaths, job.ownerId);
     }
 
@@ -702,22 +712,31 @@ export async function runJobStep(job: any) {
   }
 
   if (job.step === "save") {
-    await saveJob({
-      ...job,
-      status: "done",
-      step: "done",
-      progress: 100,
-      message: "Completed",
-    });
-
-    await db.collection("projects").updateOne(
-      { projectId: job.projectId },
+    const projectUpdate = await db.collection("projects").updateOne(
+      {
+        projectId: job.projectId,
+        ownerId: job.ownerId,
+      },
       {
         $set: {
           analysisComplete: true,
         },
       },
     );
+
+    if (projectUpdate.matchedCount !== 1) {
+      throw new Error("Unable to finalize project analysis");
+    }
+
+    await saveJob({
+      id: job.id,
+      status: "done",
+      step: "done",
+      progress: 100,
+      message: "Completed",
+    });
+
+    await cleanupRepositoryReader(job.id);
 
     return;
   }

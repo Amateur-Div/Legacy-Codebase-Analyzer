@@ -32,9 +32,6 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.extractHighlights = extractHighlights;
 exports.isBinaryFile = isBinaryFile;
@@ -42,8 +39,6 @@ exports.calculateRepositoryInsights = calculateRepositoryInsights;
 exports.detectPackageManager = detectPackageManager;
 exports.detectTags = detectTags;
 exports.buildFileTree = buildFileTree;
-const path_1 = __importDefault(require("path"));
-const fs_1 = __importDefault(require("fs"));
 const babelParser = __importStar(require("@babel/parser"));
 const language_1 = require("./language");
 const extractStructureBable_1 = require("./extractStructureBable");
@@ -181,13 +176,16 @@ function calculateRepositoryInsights(tree) {
         repositoryComposition: composition,
     };
 }
-function detectPackageManager(dir) {
-    if (fs_1.default.existsSync(path_1.default.join(dir, "pnpm-lock.yaml")))
+function detectPackageManager(files) {
+    if (files.some((file) => file.endsWith("pnpm-lock.yaml"))) {
         return "pnpm";
-    if (fs_1.default.existsSync(path_1.default.join(dir, "yarn.lock")))
+    }
+    if (files.some((file) => file.endsWith("yarn.lock"))) {
         return "yarn";
-    if (fs_1.default.existsSync(path_1.default.join(dir, "package-lock.json")))
+    }
+    if (files.some((file) => file.endsWith("package-lock.json"))) {
         return "npm";
+    }
     return "unknown";
 }
 function detectTags(packageInfo, fileTree) {
@@ -237,7 +235,7 @@ function detectTags(packageInfo, fileTree) {
     }
     return Array.from(tags);
 }
-async function buildFileTree(files, rootDir) {
+async function buildFileTree(files, readFile) {
     var _a;
     const tree = [];
     for (const file of files) {
@@ -247,16 +245,18 @@ async function buildFileTree(files, rootDir) {
             file.includes("/__tests__/")) {
             continue;
         }
-        const normalizedFile = file.endsWith("/") ? file.slice(0, -1) : file;
-        const parts = normalizedFile.split("/");
+        const normalizedFile = file.replace(/\\/g, "/").replace(/\/$/, "");
+        const parts = normalizedFile.split("/").filter(Boolean);
         let current = tree;
         for (let i = 0; i < parts.length; i++) {
             const part = parts[i];
-            const isFile = i === parts.length - 1 && !file.endsWith("/");
+            const isFile = i === parts.length - 1;
             const fullPath = parts.slice(0, i + 1).join("/");
             let existing = current.find((item) => item.name === part);
             if (!existing) {
-                let size, loc, highlights;
+                let size;
+                let loc;
+                let highlights;
                 let imports = [];
                 let functions = [];
                 let classes = [];
@@ -267,35 +267,31 @@ async function buildFileTree(files, rootDir) {
                 let schemas = [];
                 let classification = (0, fileRoleClassifier_1.classifyRepositoryFile)(file, "");
                 if (isFile) {
-                    const absolutePath = path_1.default.join(rootDir, fullPath);
                     try {
-                        const stats = fs_1.default.statSync(absolutePath);
-                        size = stats.size;
-                        if (size <= MAX_FILE_SIZE_BYTES) {
-                            const buffer = fs_1.default.readFileSync(absolutePath);
-                            if (!isBinaryFile(buffer)) {
-                                const content = buffer.toString("utf-8");
-                                loc = content.split("\n").length;
-                                classification = (0, fileRoleClassifier_1.classifyRepositoryFile)(file, content);
-                                const ext = (_a = part.split(".").pop()) === null || _a === void 0 ? void 0 : _a.toLowerCase();
-                                if (["js", "ts", "jsx", "tsx"].includes(ext || "")) {
-                                    highlights = extractHighlights(content);
-                                    const symbols = (0, extractStructureBable_1.extractStructureBabel)(fullPath, content);
-                                    imports = symbols.imports;
-                                    functions = symbols.functions;
-                                    classes = symbols.classes;
-                                    components = symbols.components;
-                                    exports = symbols.exports;
-                                    apis = symbols.apis;
-                                    schemas = symbols.schemas;
-                                    blocks = symbols.blocks;
-                                }
+                        const result = await readFile(fullPath, MAX_FILE_SIZE_BYTES);
+                        size = result.size;
+                        const buffer = result.buffer;
+                        if (buffer && !isBinaryFile(buffer)) {
+                            const content = buffer.toString("utf-8");
+                            loc = content.split("\n").length;
+                            classification = (0, fileRoleClassifier_1.classifyRepositoryFile)(file, content);
+                            const ext = (_a = part.split(".").pop()) === null || _a === void 0 ? void 0 : _a.toLowerCase();
+                            if (["js", "ts", "jsx", "tsx"].includes(ext || "")) {
+                                highlights = extractHighlights(content);
+                                const symbols = (0, extractStructureBable_1.extractStructureBabel)(fullPath, content);
+                                imports = symbols.imports;
+                                functions = symbols.functions;
+                                classes = symbols.classes;
+                                components = symbols.components;
+                                exports = symbols.exports;
+                                apis = symbols.apis;
+                                schemas = symbols.schemas;
+                                blocks = symbols.blocks;
                             }
                         }
                     }
-                    catch (err) {
-                        console.warn("Failed to read file:", fullPath);
-                        console.log("Error reading files : ", err);
+                    catch (error) {
+                        console.warn("Failed to read repository file:", fullPath, error);
                     }
                 }
                 const language = (0, language_1.detectLanguage)(fullPath);
@@ -323,8 +319,9 @@ async function buildFileTree(files, rootDir) {
                 };
                 current.push(existing);
             }
-            if (!isFile)
+            if (!isFile) {
                 current = existing.children;
+            }
         }
     }
     return tree;

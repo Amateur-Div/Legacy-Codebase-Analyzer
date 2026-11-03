@@ -1,6 +1,3 @@
-import path from "path";
-import fs from "fs";
-
 import * as babelParser from "@babel/parser";
 import { detectLanguage, getLanguageColor } from "./language";
 import { extractStructureBabel } from "./extractStructureBable";
@@ -202,10 +199,19 @@ export function calculateRepositoryInsights(tree: FileNode[]) {
   };
 }
 
-export function detectPackageManager(dir: string): string {
-  if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
-  if (fs.existsSync(path.join(dir, "yarn.lock"))) return "yarn";
-  if (fs.existsSync(path.join(dir, "package-lock.json"))) return "npm";
+export function detectPackageManager(files: string[]): string {
+  if (files.some((file) => file.endsWith("pnpm-lock.yaml"))) {
+    return "pnpm";
+  }
+
+  if (files.some((file) => file.endsWith("yarn.lock"))) {
+    return "yarn";
+  }
+
+  if (files.some((file) => file.endsWith("package-lock.json"))) {
+    return "npm";
+  }
+
   return "unknown";
 }
 
@@ -268,7 +274,20 @@ export function detectTags(packageInfo: any, fileTree: any[]): string[] {
   return Array.from(tags);
 }
 
-export async function buildFileTree(files: string[], rootDir: string) {
+export type RepositoryFileReadResult = {
+  size: number;
+  buffer?: Buffer;
+};
+
+export type RepositoryFileReader = (
+  relativePath: string,
+  maxBytes: number,
+) => Promise<RepositoryFileReadResult>;
+
+export async function buildFileTree(
+  files: string[],
+  readFile: RepositoryFileReader,
+) {
   const tree: any[] = [];
 
   for (const file of files) {
@@ -281,20 +300,23 @@ export async function buildFileTree(files: string[], rootDir: string) {
       continue;
     }
 
-    const normalizedFile = file.endsWith("/") ? file.slice(0, -1) : file;
-    const parts = normalizedFile.split("/");
+    const normalizedFile = file.replace(/\\/g, "/").replace(/\/$/, "");
+    const parts = normalizedFile.split("/").filter(Boolean);
 
     let current = tree;
 
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
-      const isFile = i === parts.length - 1 && !file.endsWith("/");
+      const isFile = i === parts.length - 1;
       const fullPath = parts.slice(0, i + 1).join("/");
 
       let existing = current.find((item) => item.name === part);
 
       if (!existing) {
-        let size, loc, highlights;
+        let size: number | undefined;
+        let loc: number | undefined;
+        let highlights;
+
         let imports: any[] = [];
         let functions: any[] = [];
         let classes: any[] = [];
@@ -303,42 +325,43 @@ export async function buildFileTree(files: string[], rootDir: string) {
         let blocks: any[] = [];
         let apis: any[] = [];
         let schemas: any[] = [];
+
         let classification = classifyRepositoryFile(file, "");
 
         if (isFile) {
-          const absolutePath = path.join(rootDir, fullPath);
-
           try {
-            const stats = fs.statSync(absolutePath);
-            size = stats.size;
+            const result = await readFile(fullPath, MAX_FILE_SIZE_BYTES);
 
-            if (size <= MAX_FILE_SIZE_BYTES) {
-              const buffer = fs.readFileSync(absolutePath);
+            size = result.size;
 
-              if (!isBinaryFile(buffer)) {
-                const content = buffer.toString("utf-8");
-                loc = content.split("\n").length;
+            const buffer = result.buffer;
 
-                classification = classifyRepositoryFile(file, content);
+            if (buffer && !isBinaryFile(buffer)) {
+              const content = buffer.toString("utf-8");
 
-                const ext = part.split(".").pop()?.toLowerCase();
-                if (["js", "ts", "jsx", "tsx"].includes(ext || "")) {
-                  highlights = extractHighlights(content);
-                  const symbols = extractStructureBabel(fullPath, content);
-                  imports = symbols.imports;
-                  functions = symbols.functions;
-                  classes = symbols.classes;
-                  components = symbols.components;
-                  exports = symbols.exports;
-                  apis = symbols.apis;
-                  schemas = symbols.schemas;
-                  blocks = symbols.blocks;
-                }
+              loc = content.split("\n").length;
+
+              classification = classifyRepositoryFile(file, content);
+
+              const ext = part.split(".").pop()?.toLowerCase();
+
+              if (["js", "ts", "jsx", "tsx"].includes(ext || "")) {
+                highlights = extractHighlights(content);
+
+                const symbols = extractStructureBabel(fullPath, content);
+
+                imports = symbols.imports;
+                functions = symbols.functions;
+                classes = symbols.classes;
+                components = symbols.components;
+                exports = symbols.exports;
+                apis = symbols.apis;
+                schemas = symbols.schemas;
+                blocks = symbols.blocks;
               }
             }
-          } catch (err: any) {
-            console.warn("Failed to read file:", fullPath);
-            console.log("Error reading files : ", err);
+          } catch (error) {
+            console.warn("Failed to read repository file:", fullPath, error);
           }
         }
 
@@ -370,7 +393,9 @@ export async function buildFileTree(files: string[], rootDir: string) {
         current.push(existing);
       }
 
-      if (!isFile) current = existing.children!;
+      if (!isFile) {
+        current = existing.children!;
+      }
     }
   }
 

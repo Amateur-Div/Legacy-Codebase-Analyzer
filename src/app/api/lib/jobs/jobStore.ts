@@ -12,6 +12,30 @@ export async function saveJob(job: Partial<Job> & { id: string }) {
   await collection.updateOne({ id }, { $set: updates }, { upsert: true });
 }
 
+export async function saveJobLifecycle(
+  job: Partial<Job> & {
+    id: string;
+    status: Job["status"];
+  },
+) {
+  const db = (await clientPromise).db();
+  const collection = db.collection(COLLECTION);
+
+  const { id, ...updates } = job;
+
+  const result = await collection.updateOne(
+    {
+      id,
+      status: { $nin: ["done", "cancelled"] },
+    },
+    {
+      $set: updates,
+    },
+  );
+
+  return result.modifiedCount === 1;
+}
+
 export async function loadJob(jobId: string): Promise<Job | null> {
   const db = (await clientPromise).db();
   const collection = db.collection(COLLECTION);
