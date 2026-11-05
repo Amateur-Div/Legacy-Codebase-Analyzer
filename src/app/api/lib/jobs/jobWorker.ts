@@ -65,6 +65,7 @@ interface ActiveRepository {
 }
 
 const activeRepositories = new Map<string, ActiveRepository>();
+const repositoryReaderPromises = new Map<string, Promise<RepositoryReader>>();
 
 async function getRepositoryReader(
   job: any,
@@ -76,35 +77,54 @@ async function getRepositoryReader(
     return existing.reader;
   }
 
-  const project = await db.collection("projects").findOne({
-    projectId: job.projectId,
-  });
+  const inFlight = repositoryReaderPromises.get(job.id);
 
-  const blobPathname = project?.blobPathname;
-
-  if (
-    typeof blobPathname !== "string" ||
-    !blobPathname.startsWith("repository-uploads/")
-  ) {
-    throw new Error("Project repository Blob pathname is missing");
+  if (inFlight) {
+    return inFlight;
   }
 
-  const archiveBuffer = await downloadRepositoryArchive(blobPathname);
+  const initializationPromise = (async () => {
+    const project = await db.collection("projects").findOne({
+      projectId: job.projectId,
+      ownerId: job.ownerId,
+    });
+
+    const blobPathname = project?.blobPathname;
+
+    if (
+      typeof blobPathname !== "string" ||
+      !blobPathname.startsWith("repository-uploads/")
+    ) {
+      throw new Error("Project repository Blob pathname is missing");
+    }
+
+    const archiveBuffer = await downloadRepositoryArchive(blobPathname);
+
+    try {
+      const reader = await createRepositoryReader(archiveBuffer, {
+        ignoredDirectories: IGNORE_DIRS,
+      });
+
+      activeRepositories.set(job.id, {
+        reader,
+        cleanupArchive: async () => {},
+      });
+
+      return reader;
+    } catch (error) {
+      archiveBuffer.fill(0);
+      throw error;
+    }
+  })();
+
+  repositoryReaderPromises.set(job.id, initializationPromise);
 
   try {
-    const reader = await createRepositoryReader(archiveBuffer, {
-      ignoredDirectories: IGNORE_DIRS,
-    });
-
-    activeRepositories.set(job.id, {
-      reader,
-      cleanupArchive: async () => {},
-    });
-
-    return reader;
-  } catch (error) {
-    archiveBuffer.fill(0);
-    throw error;
+    return await initializationPromise;
+  } finally {
+    if (repositoryReaderPromises.get(job.id) === initializationPromise) {
+      repositoryReaderPromises.delete(job.id);
+    }
   }
 }
 
@@ -195,8 +215,40 @@ function collectFileUniverse(fileTree: any[]) {
   };
 }
 
+export class StaleAnalysisJobError extends Error {
+  constructor(jobId: string) {
+    super(`Analysis job is no longer active: ${jobId}`);
+    this.name = "StaleAnalysisJobError";
+  }
+}
+
+async function assertActiveAnalysisJob(job: {
+  id: string;
+  projectId: string;
+  ownerId: string;
+}) {
+  const db = (await clientPromise).db();
+
+  const project = await db.collection("projects").findOne(
+    {
+      projectId: job.projectId,
+      ownerId: job.ownerId,
+      activeAnalysisJobId: job.id,
+    },
+    {
+      projection: { _id: 1 },
+    },
+  );
+
+  if (!project) {
+    throw new StaleAnalysisJobError(job.id);
+  }
+}
+
 export async function runJobStep(job: any) {
   if (job.status === "done") return;
+
+  await assertActiveAnalysisJob(job);
 
   const db = (await clientPromise).db();
 
@@ -329,8 +381,12 @@ export async function runJobStep(job: any) {
 
     const tags = detectTags(packageInfo, fileTree);
 
-    await db.collection("projects").updateOne(
-      { projectId: job.projectId },
+    const metadataUpdate = await db.collection("projects").updateOne(
+      {
+        projectId: job.projectId,
+        ownerId: job.ownerId,
+        activeAnalysisJobId: job.id,
+      },
       {
         $set: {
           fileTree,
@@ -342,6 +398,10 @@ export async function runJobStep(job: any) {
         },
       },
     );
+
+    if (metadataUpdate.matchedCount !== 1) {
+      throw new Error("Project metadata write was rejected");
+    }
 
     await saveJob({
       id: job.id,
@@ -452,30 +512,41 @@ export async function runJobStep(job: any) {
         }),
       );
 
-      const docs = results.filter(Boolean).map((r: any) => ({
-        updateOne: {
-          filter: {
+      const docs = results.filter(Boolean).map((r: any) => {
+        const update: Record<string, any> = {
+          $set: {
             projectId: job.projectId,
             path: r.relPath,
+            size: r.size,
+            language: detectLanguage(r.relPath),
+            isCode: isGraphSupportedFile(r.relPath),
+            functions: r.functions,
+            classes: r.classes,
+            imports: r.imports,
+            exports: r.exports,
+            components: r.components,
           },
-          update: {
-            $set: {
+        };
+
+        if (r.size <= MAX_DB_FILE_SIZE) {
+          update.$set.content = r.content;
+        } else {
+          update.$unset = {
+            content: "",
+          };
+        }
+
+        return {
+          updateOne: {
+            filter: {
               projectId: job.projectId,
               path: r.relPath,
-              size: r.size,
-              language: detectLanguage(r.relPath),
-              isCode: isGraphSupportedFile(r.relPath),
-              content: r.size <= MAX_DB_FILE_SIZE ? r.content : undefined,
-              functions: r.functions,
-              classes: r.classes,
-              imports: r.imports,
-              exports: r.exports,
-              components: r.components,
             },
+            update,
+            upsert: true,
           },
-          upsert: true,
-        },
-      }));
+        };
+      });
 
       if (docs.length) {
         await db.collection("project_files").bulkWrite(docs);
@@ -528,8 +599,12 @@ export async function runJobStep(job: any) {
   if (job.step === "enrich") {
     const project = await db.collection("projects").findOne({
       projectId: job.projectId,
-      members: job.ownerId,
+      ownerId: job.ownerId,
     });
+
+    if (!project) {
+      throw new Error("Project not found or ownership validation failed");
+    }
 
     const fileTree = project?.fileTree || [];
 
@@ -537,10 +612,11 @@ export async function runJobStep(job: any) {
 
     attachCrossFileImpact(fileTree, resolverConfig);
 
-    await db.collection("projects").updateOne(
+    const fileTreeUpdate = await db.collection("projects").updateOne(
       {
         projectId: job.projectId,
-        members: job.ownerId,
+        ownerId: job.ownerId,
+        activeAnalysisJobId: job.id,
       },
       {
         $set: {
@@ -548,6 +624,10 @@ export async function runJobStep(job: any) {
         },
       },
     );
+
+    if (fileTreeUpdate.matchedCount !== 1) {
+      throw new Error("Unable to update project file tree");
+    }
 
     const storedFileGraphs = await getFileGraphs(job.projectId, job.ownerId);
 
@@ -684,9 +764,10 @@ export async function runJobStep(job: any) {
       files: enrichedFileGraphs.length,
     });
 
-    await db.collection("projects").updateOne(
+    const dependencyUpdate = await db.collection("projects").updateOne(
       {
         projectId: job.projectId,
+        ownerId: job.ownerId,
       },
       {
         $set: {
@@ -694,6 +775,10 @@ export async function runJobStep(job: any) {
         },
       },
     );
+
+    if (dependencyUpdate.matchedCount !== 1) {
+      throw new Error("Unable to save project dependency analysis");
+    }
 
     console.log("[intelligence] Distributed:", {
       deadFiles: distributedDeadFiles.length,
@@ -716,6 +801,7 @@ export async function runJobStep(job: any) {
       {
         projectId: job.projectId,
         ownerId: job.ownerId,
+        activeAnalysisJobId: job.id,
       },
       {
         $set: {
@@ -740,4 +826,6 @@ export async function runJobStep(job: any) {
 
     return;
   }
+
+  throw new Error(`Unsupported analysis job step: ${job.step}`);
 }

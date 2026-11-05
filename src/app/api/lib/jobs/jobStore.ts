@@ -12,28 +12,78 @@ export async function saveJob(job: Partial<Job> & { id: string }) {
   await collection.updateOne({ id }, { $set: updates }, { upsert: true });
 }
 
+const ALLOWED_TRANSITIONS: Record<Job["status"], Job["status"][]> = {
+  initialized: ["running", "cancelled", "error"],
+  running: ["running", "retrying", "done", "error", "cancelled"],
+  retrying: ["running", "error", "cancelled"],
+  done: [],
+  error: [],
+  cancelled: [],
+};
+
+export function isAllowedJobTransition(
+  expectedStatus: Job["status"],
+  nextStatus: Job["status"],
+): boolean {
+  return ALLOWED_TRANSITIONS[expectedStatus].includes(nextStatus);
+}
+
 export async function saveJobLifecycle(
   job: Partial<Job> & {
     id: string;
     status: Job["status"];
   },
-) {
+  expectedStatus: Job["status"],
+): Promise<boolean> {
+  if (!isAllowedJobTransition(expectedStatus, job.status)) {
+    throw new Error(
+      `Invalid job status transition: ${expectedStatus} -> ${job.status}`,
+    );
+  }
+
   const db = (await clientPromise).db();
   const collection = db.collection(COLLECTION);
 
-  const { id, ...updates } = job;
+  const existingJob = await collection.findOne(
+    { id: job.id },
+    {
+      projection: {
+        projectId: 1,
+        ownerId: 1,
+        status: 1,
+      },
+    },
+  );
+
+  if (!existingJob) {
+    return false;
+  }
+
+  if (
+    typeof existingJob.projectId !== "string" ||
+    typeof existingJob.ownerId !== "string"
+  ) {
+    throw new Error(`Job ${job.id} is missing project or owner scope`);
+  }
+
+  const { id, status, ...updates } = job;
 
   const result = await collection.updateOne(
     {
       id,
-      status: { $nin: ["done", "cancelled"] },
+      projectId: existingJob.projectId,
+      ownerId: existingJob.ownerId,
+      status: expectedStatus,
     },
     {
-      $set: updates,
+      $set: {
+        ...updates,
+        status,
+      },
     },
   );
 
-  return result.modifiedCount === 1;
+  return result.matchedCount === 1;
 }
 
 export async function loadJob(jobId: string): Promise<Job | null> {

@@ -209,10 +209,33 @@ export async function POST(req: NextRequest) {
           entryPoints: [],
           tags: [],
           analysisComplete: false,
+          activeAnalysisJobId: stableJobId,
         },
       },
       { upsert: true },
     );
+
+    const activeJobClaim = await db.collection("projects").updateOne(
+      {
+        projectId: claimedIntent.projectId,
+        ownerId: uid,
+        $or: [
+          { activeAnalysisJobId: { $exists: false } },
+          { activeAnalysisJobId: stableJobId },
+        ],
+      },
+      {
+        $set: {
+          activeAnalysisJobId: stableJobId,
+        },
+      },
+    );
+
+    if (activeJobClaim.matchedCount !== 1) {
+      throw new Error(
+        "Project is already associated with a different active analysis job",
+      );
+    }
 
     let job = await loadJob(stableJobId);
 
