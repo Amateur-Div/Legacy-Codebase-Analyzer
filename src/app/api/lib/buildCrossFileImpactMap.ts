@@ -295,8 +295,6 @@ export function attachCrossFileImpact(
     const normalizedPath = path.posix.normalize(file.relPath);
 
     fileLookup.set(normalizedPath, file.relPath);
-
-    fileLookup.set(stripSourceExtension(normalizedPath), file.relPath);
   }
 
   const forwardMap: Record<string, ForwardImpact> = {};

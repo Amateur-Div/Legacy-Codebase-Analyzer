@@ -181,21 +181,36 @@ function normalizeFilePath(path: string) {
 }
 
 function createImportVisitor(ctx: ExtractContext) {
+  const addImport = (source: string, node: any) => {
+    if (ctx.seen.imports.has(source)) {
+      return;
+    }
+
+    ctx.seen.imports.add(source);
+
+    ctx.imports.push({
+      id: `import:${normalizeFilePath(ctx.filePath)}:${source}`,
+      name: source,
+      start: node.loc?.start.line ?? 0,
+      end: node.loc?.end.line ?? null,
+    });
+  };
+
   return {
     enter(path: any) {
       const node = path.node;
 
       if (isImportDeclaration(node) && isStringLiteral(node.source)) {
-        const val = node.source.value;
-        if (!ctx.seen.imports.has(val)) {
-          ctx.seen.imports.add(val);
-          ctx.imports.push({
-            id: `import:${normalizeFilePath(ctx.filePath)}:${val}`,
-            name: val,
-            start: node.loc?.start.line ?? 0,
-            end: node.loc?.end.line ?? null,
-          });
-        }
+        addImport(node.source.value, node);
+      }
+
+      if (
+        (node.type === "ExportNamedDeclaration" ||
+          node.type === "ExportAllDeclaration") &&
+        node.source &&
+        isStringLiteral(node.source)
+      ) {
+        addImport(node.source.value, node);
       }
 
       if (
@@ -205,16 +220,7 @@ function createImportVisitor(ctx: ExtractContext) {
         node.arguments.length === 1 &&
         isStringLiteral(node.arguments[0])
       ) {
-        const val = node.arguments[0].value;
-        if (!ctx.seen.imports.has(val)) {
-          ctx.seen.imports.add(val);
-          ctx.imports.push({
-            id: `import:${normalizeFilePath(ctx.filePath)}:${val}`,
-            name: val,
-            start: node.loc?.start.line ?? 0,
-            end: node.loc?.end.line ?? null,
-          });
-        }
+        addImport(node.arguments[0].value, node);
       }
 
       if (
@@ -223,17 +229,7 @@ function createImportVisitor(ctx: ExtractContext) {
         node.arguments.length === 1 &&
         isStringLiteral(node.arguments[0])
       ) {
-        const val = node.arguments[0].value;
-
-        if (!ctx.seen.imports.has(val)) {
-          ctx.seen.imports.add(val);
-          ctx.imports.push({
-            id: `import:${normalizeFilePath(ctx.filePath)}:${val}`,
-            name: val,
-            start: node.loc?.start.line ?? 0,
-            end: node.loc?.end.line ?? null,
-          });
-        }
+        addImport(node.arguments[0].value, node);
       }
     },
   };
