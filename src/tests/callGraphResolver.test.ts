@@ -89,6 +89,48 @@ describe("resolveCallGraph", () => {
     expect(result.diagnostics.some((item) => item.kind === "unresolved-export")).toBe(true);
   });
 
+
+  it("labels package calls as external instead of treating them as unresolved repository edges", () => {
+    const graph = extractCallGraphBabel(
+      "repo/src/worker.ts",
+      `
+        import { debounce } from "lodash";
+        export function run() {
+          debounce(() => {}, 10);
+        }
+      `,
+    );
+
+    const result = resolveCallGraph([graph], { repoRoot: "repo" });
+    expect(result.edges).toEqual([]);
+    expect(result.diagnostics.some((item) => item.kind === "external-module")).toBe(true);
+    expect(result.diagnostics.some((item) => item.kind === "unresolved-module")).toBe(false);
+  });
+
+  it("terminates safely when re-export chains contain a cycle", () => {
+    const first = extractCallGraphBabel(
+      "repo/src/first.ts",
+      `export { run } from "./second";`,
+    );
+    const second = extractCallGraphBabel(
+      "repo/src/second.ts",
+      `export { run } from "./first";`,
+    );
+    const entry = extractCallGraphBabel(
+      "repo/src/entry.ts",
+      `
+        import { run } from "./first";
+        export function start() {
+          run();
+        }
+      `,
+    );
+
+    const result = resolveCallGraph([first, second, entry], { repoRoot: "repo" });
+    expect(result.edges).toEqual([]);
+    expect(result.diagnostics.some((item) => item.kind === "unresolved-export")).toBe(true);
+  });
+
   it("does not emit edges for calls without a statically resolved target", () => {
     const graph = extractCallGraphBabel(
       "repo/src/worker.ts",
