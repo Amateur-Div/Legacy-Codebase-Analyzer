@@ -337,9 +337,13 @@ export function extractCallGraphBabel(
       if (!declaration) {
         for (const specifier of node.specifiers) {
           if (specifier.type !== "ExportSpecifier") continue;
+          const localName = getPropertyName(specifier.local) ?? undefined;
+          const binding = localName ? path.scope.getBinding(localName) : undefined;
+          const symbol = getSymbolForBinding(binding, symbolByNode);
           addExport({
             exportedName: getPropertyName(specifier.exported) ?? "unknown",
-            localName: getPropertyName(specifier.local) ?? undefined,
+            localName,
+            targetSymbolId: symbol?.id,
             kind: "local",
             line,
           });
@@ -376,7 +380,11 @@ export function extractCallGraphBabel(
     },
     ExportDefaultDeclaration(path: NodePath<t.ExportDefaultDeclaration>) {
       const declaration = path.node.declaration;
-      const symbol = symbolByNode.get(declaration as t.Node);
+      const symbol =
+        symbolByNode.get(declaration as t.Node) ??
+        (declaration.type === "Identifier"
+          ? getSymbolForBinding(path.scope.getBinding(declaration.name), symbolByNode)
+          : undefined);
       addExport({
         exportedName: "default",
         localName:
