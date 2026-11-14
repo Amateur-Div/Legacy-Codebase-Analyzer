@@ -21,8 +21,8 @@ function parseBoundedInteger(
   max: number,
 ): number {
   if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) return fallback;
   return Math.min(max, Math.max(min, parsed));
 }
 
@@ -40,9 +40,15 @@ export async function GET(
     const entrySymbolName = req.nextUrl.searchParams.get("entrySymbol");
     const entrySymbolId = req.nextUrl.searchParams.get("entrySymbolId");
 
-    if (!rawEntryFile || (!entrySymbolName && !entrySymbolId)) {
+    if (
+      !rawEntryFile ||
+      rawEntryFile.length > 1024 ||
+      (!entrySymbolName && !entrySymbolId) ||
+      (entrySymbolName && entrySymbolName.length > 256) ||
+      (entrySymbolId && entrySymbolId.length > 2048)
+    ) {
       return NextResponse.json(
-        { error: "entryFile and entrySymbol (or entrySymbolId) are required" },
+        { error: "A valid entryFile and entrySymbol (or entrySymbolId) are required" },
         { status: 400 },
       );
     }
