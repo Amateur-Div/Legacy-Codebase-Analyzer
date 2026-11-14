@@ -447,7 +447,7 @@ export function extractCallGraphBabel(
           : undefined;
 
         const imported = importByLocalName.get(rootIdentifier);
-        if (imported && binding?.path?.isImportSpecifier?.()) {
+        if (imported && binding?.path?.parentPath?.isImportDeclaration?.()) {
           importedBinding = {
             source: imported.source,
             localName: imported.localName,
