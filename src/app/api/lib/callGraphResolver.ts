@@ -1,10 +1,8 @@
+import type { CallGraphExtraction } from "./callGraphExtractor";
 import {
-  CallGraphExtraction,
-  ExtractedCallSite,
-} from "./callGraphExtractor";
-import {
-  ModuleResolverConfig,
   resolveModule,
+  type ModuleResolution,
+  type ModuleResolverConfig,
 } from "./buildCrossFileImpactMap";
 
 export type ResolvedCallEdge = {
@@ -27,7 +25,11 @@ export type CallGraphResolutionResult = {
   diagnostics: Array<{
     filePath: string;
     callSiteId: string;
-    kind: "unresolved-module" | "unresolved-export" | "missing-caller";
+    kind:
+      | "external-module"
+      | "unresolved-module"
+      | "unresolved-export"
+      | "missing-caller";
     message: string;
   }>;
 };
@@ -57,15 +59,14 @@ export function resolveCallGraph(
     }
   }
 
-  const moduleResolutionCache = new Map<string, string | null>();
-  const resolveImportedFile = (
+  const moduleResolutionCache = new Map<string, ModuleResolution>();
+  const resolveImportedModule = (
     importer: string,
     source: string,
-  ): string | null => {
+  ): ModuleResolution => {
     const cacheKey = `${importer}::${source}`;
-    if (moduleResolutionCache.has(cacheKey)) {
-      return moduleResolutionCache.get(cacheKey) ?? null;
-    }
+    const cached = moduleResolutionCache.get(cacheKey);
+    if (cached) return cached;
 
     const resolution = resolveModule(
       importer,
@@ -74,9 +75,8 @@ export function resolveCallGraph(
       options.repoRoot,
       resolverConfig,
     );
-    const resolved = resolution.kind === "internal" ? resolution.path : null;
-    moduleResolutionCache.set(cacheKey, resolved);
-    return resolved;
+    moduleResolutionCache.set(cacheKey, resolution);
+    return resolution;
   };
 
   const exportResolutionCache = new Map<string, string | null>();
@@ -110,10 +110,10 @@ export function resolveCallGraph(
     let resolved: string | null = exported.targetSymbolId ?? null;
 
     if (!resolved && exported.kind === "reexport" && exported.source) {
-      const targetFile = resolveImportedFile(filePath, exported.source);
-      resolved = targetFile
+      const moduleResolution = resolveImportedModule(filePath, exported.source);
+      resolved = moduleResolution.kind === "internal"
         ? resolveExportedSymbol(
-            targetFile,
+            moduleResolution.path,
             exported.importedName ?? exported.exportedName,
             visited,
           )
@@ -126,10 +126,10 @@ export function resolveCallGraph(
         (entry) => entry.localName === exported.localName,
       );
       if (imported) {
-        const targetFile = resolveImportedFile(filePath, imported.source);
-        resolved = targetFile
+        const moduleResolution = resolveImportedModule(filePath, imported.source);
+        resolved = moduleResolution.kind === "internal"
           ? resolveExportedSymbol(
-              targetFile,
+              moduleResolution.path,
               imported.importedName,
               visited,
             )
@@ -161,23 +161,33 @@ export function resolveCallGraph(
       if (callSite.resolution === "local" && targetSymbolId) {
         resolution = "same-file";
       } else if (callSite.importedBinding) {
-        const targetFile = resolveImportedFile(
+        const moduleResolution = resolveImportedModule(
           graph.filePath,
           callSite.importedBinding.source,
         );
 
-        if (!targetFile) {
+        if (moduleResolution.kind === "external") {
+          diagnostics.push({
+            filePath: graph.filePath,
+            callSiteId: callSite.id,
+            kind: "external-module",
+            message: `Call targets external dependency "${callSite.importedBinding.source}"`,
+          });
+          continue;
+        }
+
+        if (moduleResolution.kind === "unresolved") {
           diagnostics.push({
             filePath: graph.filePath,
             callSiteId: callSite.id,
             kind: "unresolved-module",
-            message: `Unable to resolve module "${callSite.importedBinding.source}"`,
+            message: `Unable to resolve internal module "${callSite.importedBinding.source}"`,
           });
           continue;
         }
 
         targetSymbolId = resolveExportedSymbol(
-          targetFile,
+          moduleResolution.path,
           callSite.importedBinding.importedName,
           new Set<string>(),
         ) ?? undefined;
