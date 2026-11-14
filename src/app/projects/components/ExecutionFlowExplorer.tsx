@@ -340,7 +340,7 @@ export default function ExecutionFlowExplorer({
         </button>
 
         {selectedEntry && (
-          <div className="md:col-span-3">
+          <div className="md:col-span-4">
             <p className="text-xs text-muted-foreground">
               {selectedEntry.framework ?? "Detected entry"} · confidence score {selectedEntry.score ?? "—"}
               {selectedEntry.reasons.length ? ` · ${selectedEntry.reasons.join(", ")}` : ""}
