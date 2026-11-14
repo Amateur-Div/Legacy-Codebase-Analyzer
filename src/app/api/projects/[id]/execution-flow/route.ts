@@ -43,12 +43,11 @@ export async function GET(
     if (
       !rawEntryFile ||
       rawEntryFile.length > 1024 ||
-      (!entrySymbolName && !entrySymbolId) ||
       (entrySymbolName && entrySymbolName.length > 256) ||
       (entrySymbolId && entrySymbolId.length > 2048)
     ) {
       return NextResponse.json(
-        { error: "A valid entryFile and entrySymbol (or entrySymbolId) are required" },
+        { error: "A valid entryFile is required" },
         { status: 400 },
       );
     }
@@ -130,6 +129,21 @@ export async function GET(
       );
     }
 
+    const availableSymbols = rootGraph.symbols.map((symbol) => ({
+      id: symbol.id,
+      name: symbol.name,
+      kind: symbol.kind,
+      isExported: symbol.isExported,
+      startLine: symbol.startLine,
+    }));
+
+    if (!entrySymbolName && !entrySymbolId) {
+      return NextResponse.json(
+        { projectId, entryFile, availableSymbols },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    }
+
     const matchingSymbols = entrySymbolId
       ? rootGraph.symbols.filter((symbol) => symbol.id === entrySymbolId)
       : rootGraph.symbols.filter((symbol) => symbol.name === entrySymbolName);
@@ -147,13 +161,7 @@ export async function GET(
             matchingSymbols.length > 1
               ? "Entry symbol name is ambiguous; select a specific symbol ID"
               : "Entry symbol not found in the selected file",
-          availableSymbols: rootGraph.symbols.map((symbol) => ({
-            id: symbol.id,
-            name: symbol.name,
-            kind: symbol.kind,
-            isExported: symbol.isExported,
-            startLine: symbol.startLine,
-          })),
+          availableSymbols,
         },
         { status: matchingSymbols.length > 1 ? 409 : 404 },
       );
