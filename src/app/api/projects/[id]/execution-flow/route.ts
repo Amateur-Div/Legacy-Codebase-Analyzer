@@ -217,7 +217,9 @@ export async function GET(
         if (!graph) continue;
 
         const unresolvedCallIds = new Set(
-          graph.resolutionDiagnostics.map((diagnostic) => diagnostic.callSiteId),
+          graph.resolutionDiagnostics
+            .filter((diagnostic) => diagnostic.kind !== "external-module")
+            .map((diagnostic) => diagnostic.callSiteId),
         );
         diagnostics.unresolvedCalls += graph.callSites.filter(
           (call) =>
