@@ -456,16 +456,32 @@ export function extractCallGraphBabel(
 
         const imported = importByLocalName.get(rootIdentifier);
         if (imported && binding?.path?.parentPath?.isImportDeclaration?.()) {
-          importedBinding = {
-            source: imported.source,
-            localName: imported.localName,
-            importedName:
-              imported.kind === "namespace" && isMember
-                ? getPropertyName(callee.property) ?? "*"
-                : imported.importedName,
-            kind: imported.kind,
-          };
-          resolution = "imported";
+          let importedName: string | null = null;
+
+          if (isIdentifier && imported.kind !== "namespace") {
+            importedName = imported.importedName;
+          } else if (isMember && imported.kind === "namespace") {
+            const property = callee.property;
+            const isStaticComputedProperty =
+              !callee.computed ||
+              property?.type === "StringLiteral" ||
+              property?.type === "NumericLiteral";
+            if (isStaticComputedProperty) {
+              importedName = getPropertyName(property);
+            }
+          }
+
+          // A default/named import may be an object with methods. Do not
+          // mistake object.method() for a call to the imported binding itself.
+          if (importedName) {
+            importedBinding = {
+              source: imported.source,
+              localName: imported.localName,
+              importedName,
+              kind: imported.kind,
+            };
+            resolution = "imported";
+          }
         } else if (targetSymbol) {
           resolution = "local";
         }
