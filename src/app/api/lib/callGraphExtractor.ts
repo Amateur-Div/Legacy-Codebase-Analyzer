@@ -9,7 +9,7 @@ export type CallableSymbolKind =
   | "method"
   | "callback";
 
-export type CallResolution = "local" | "imported" | "unresolved" | "dynamic";
+export type CallResolution = "local" | "imported" | "resolved-import" | "unresolved" | "dynamic";
 
 export interface CallableSymbol {
   id: string;
