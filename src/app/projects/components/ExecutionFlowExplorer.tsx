@@ -106,6 +106,7 @@ export default function ExecutionFlowExplorer({
   const [entryFile, setEntryFile] = useState("");
   const [symbols, setSymbols] = useState<EntrySymbol[]>([]);
   const [entrySymbolId, setEntrySymbolId] = useState("");
+  const [depth, setDepth] = useState("2");
   const [flow, setFlow] = useState<ExecutionFlowResponse | null>(null);
   const [loadingSymbols, setLoadingSymbols] = useState(false);
   const [loadingFlow, setLoadingFlow] = useState(false);
@@ -177,7 +178,7 @@ export default function ExecutionFlowExplorer({
       const params = new URLSearchParams({
         entryFile,
         entrySymbolId,
-        depth: "2",
+        depth,
         limit: "150",
       });
       const response = await fetch(
@@ -273,7 +274,7 @@ export default function ExecutionFlowExplorer({
 
   return (
     <div className="flex h-full min-h-[600px] flex-col gap-4">
-      <div className="grid gap-3 rounded-xl border bg-card p-4 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.8fr)_auto] md:items-end">
+      <div className="grid gap-3 rounded-xl border bg-card p-4 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.8fr)_100px_auto] md:items-end">
         <label className="min-w-0 space-y-1.5">
           <span className="text-xs font-medium text-muted-foreground">Entry point</span>
           <select
@@ -309,6 +310,22 @@ export default function ExecutionFlowExplorer({
                 </option>
               ))
             )}
+          </select>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-medium text-muted-foreground">Depth</span>
+          <select
+            value={depth}
+            onChange={(event) => {
+              setDepth(event.target.value);
+              setFlow(null);
+            }}
+            className="h-10 w-full rounded-md border bg-background px-2 text-sm"
+          >
+            {[1, 2, 3, 4, 5].map((value) => (
+              <option key={value} value={String(value)}>{value} levels</option>
+            ))}
           </select>
         </label>
 
