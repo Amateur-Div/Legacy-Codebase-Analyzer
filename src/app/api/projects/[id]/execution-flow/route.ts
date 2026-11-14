@@ -176,6 +176,7 @@ export async function GET(
     const visited = new Set<string>([rootSymbol.id]);
     const diagnostics = {
       unresolvedCalls: 0,
+      externalCalls: 0,
       truncated: false,
     };
 
@@ -227,6 +228,16 @@ export async function GET(
             (call.resolution === "unresolved" ||
               call.resolution === "dynamic" ||
               unresolvedCallIds.has(call.id)),
+        ).length;
+        const externalCallIds = new Set(
+          graph.resolutionDiagnostics
+            .filter((diagnostic) => diagnostic.kind === "external-module")
+            .map((diagnostic) => diagnostic.callSiteId),
+        );
+        diagnostics.externalCalls += graph.callSites.filter(
+          (call) =>
+            call.callerSymbolId === current.symbolId &&
+            externalCallIds.has(call.id),
         ).length;
 
         for (const edge of graph.edges) {
