@@ -50,11 +50,23 @@ export function resolveCallGraph(
   const resolverConfig = options.resolverConfig ?? {};
   const diagnostics: CallGraphResolutionResult["diagnostics"] = [];
   const edges: ResolvedCallEdge[] = [];
+  const symbolFileById = new Map<string, string>();
+  for (const graph of inputGraphs) {
+    for (const symbol of graph.symbols) {
+      symbolFileById.set(symbol.id, graph.filePath);
+    }
+  }
 
+  const moduleResolutionCache = new Map<string, string | null>();
   const resolveImportedFile = (
     importer: string,
     source: string,
   ): string | null => {
+    const cacheKey = `${importer}::${source}`;
+    if (moduleResolutionCache.has(cacheKey)) {
+      return moduleResolutionCache.get(cacheKey) ?? null;
+    }
+
     const resolution = resolveModule(
       importer,
       source,
@@ -62,8 +74,12 @@ export function resolveCallGraph(
       options.repoRoot,
       resolverConfig,
     );
-    return resolution.kind === "internal" ? resolution.path : null;
+    const resolved = resolution.kind === "internal" ? resolution.path : null;
+    moduleResolutionCache.set(cacheKey, resolved);
+    return resolved;
   };
+
+  const exportResolutionCache = new Map<string, string | null>();
 
   const resolveExportedSymbol = (
     filePath: string,
@@ -71,21 +87,31 @@ export function resolveCallGraph(
     visited: Set<string>,
   ): string | null => {
     const visitKey = `${filePath}::${exportedName}`;
+    if (exportResolutionCache.has(visitKey)) {
+      return exportResolutionCache.get(visitKey) ?? null;
+    }
     if (visited.has(visitKey)) return null;
     visited.add(visitKey);
 
     const graph = graphsByPath.get(filePath);
-    if (!graph) return null;
+    if (!graph) {
+      exportResolutionCache.set(visitKey, null);
+      return null;
+    }
 
     const exported = graph.exports.find(
       (entry) => entry.exportedName === exportedName,
     );
-    if (!exported) return null;
-    if (exported.targetSymbolId) return exported.targetSymbolId;
+    if (!exported) {
+      exportResolutionCache.set(visitKey, null);
+      return null;
+    }
 
-    if (exported.kind === "reexport" && exported.source) {
+    let resolved: string | null = exported.targetSymbolId ?? null;
+
+    if (!resolved && exported.kind === "reexport" && exported.source) {
       const targetFile = resolveImportedFile(filePath, exported.source);
-      return targetFile
+      resolved = targetFile
         ? resolveExportedSymbol(
             targetFile,
             exported.importedName ?? exported.exportedName,
@@ -95,13 +121,13 @@ export function resolveCallGraph(
     }
 
     // Handles: import { fn } from "./x"; export { fn as publicFn }.
-    if (exported.localName) {
+    if (!resolved && exported.localName) {
       const imported = graph.imports.find(
         (entry) => entry.localName === exported.localName,
       );
       if (imported) {
         const targetFile = resolveImportedFile(filePath, imported.source);
-        return targetFile
+        resolved = targetFile
           ? resolveExportedSymbol(
               targetFile,
               imported.importedName,
@@ -111,7 +137,8 @@ export function resolveCallGraph(
       }
     }
 
-    return null;
+    exportResolutionCache.set(visitKey, resolved);
+    return resolved;
   };
 
   const files = inputGraphs.map((graph) => ({
@@ -188,12 +215,7 @@ export function resolveCallGraph(
         fromSymbolId: callSite.callerSymbolId,
         toSymbolId: targetSymbolId,
         fromFilePath: graph.filePath,
-        toFilePath:
-          resolution === "same-file"
-            ? graph.filePath
-            : inputGraphs.find((candidate) =>
-                candidate.symbols.some((symbol) => symbol.id === targetSymbolId),
-              )?.filePath ?? "",
+        toFilePath: symbolFileById.get(targetSymbolId) ?? graph.filePath,
         callSiteId: callSite.id,
         line: callSite.line,
         calleeText: callSite.calleeText,
