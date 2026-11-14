@@ -198,6 +198,7 @@ function getSymbolForBinding(
 export function extractCallGraphBabel(
   inputFilePath: string,
   code: string,
+  parsedAst?: ReturnType<typeof babelParser.parse>,
 ): CallGraphExtraction {
   const filePath = normalizePath(inputFilePath);
   const empty: CallGraphExtraction = {
@@ -213,33 +214,37 @@ export function extractCallGraphBabel(
   if (!code.trim()) return empty;
 
   let ast: ReturnType<typeof babelParser.parse>;
-  try {
-    ast = babelParser.parse(code, {
-      sourceType: "unambiguous",
-      allowReturnOutsideFunction: true,
-      errorRecovery: true,
-      plugins: [
-        "typescript",
-        "jsx",
-        ["decorators", { decoratorsBeforeExport: false }],
-        "classProperties",
-        "classPrivateProperties",
-        "classPrivateMethods",
-        "dynamicImport",
-        "optionalChaining",
-        "nullishCoalescingOperator",
-      ],
-    });
-  } catch (error: any) {
-    return {
-      ...empty,
-      diagnostics: [{
-        kind: "parse-error",
-        message: error?.message ?? "Unable to parse source file",
-        line: error?.loc?.line,
-        column: error?.loc?.column,
-      }],
-    };
+  if (parsedAst) {
+    ast = parsedAst;
+  } else {
+    try {
+      ast = babelParser.parse(code, {
+        sourceType: "unambiguous",
+        allowReturnOutsideFunction: true,
+        errorRecovery: true,
+        plugins: [
+          "typescript",
+          "jsx",
+          ["decorators", { decoratorsBeforeExport: false }],
+          "classProperties",
+          "classPrivateProperties",
+          "classPrivateMethods",
+          "dynamicImport",
+          "optionalChaining",
+          "nullishCoalescingOperator",
+        ],
+      });
+    } catch (error: any) {
+      return {
+        ...empty,
+        diagnostics: [{
+          kind: "parse-error",
+          message: error?.message ?? "Unable to parse source file",
+          line: error?.loc?.line,
+          column: error?.loc?.column,
+        }],
+      };
+    }
   }
 
   const symbolByNode = new Map<t.Node, CallableSymbol>();
