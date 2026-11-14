@@ -6,9 +6,9 @@ import { ObjectId } from "bson";
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> },
 ) {
-  const projectId = params.id;
+  const { id: projectId } = await params;
 
   const token = req.headers.get("authorization")?.replace("Bearer ", "");
   const user = await authMiddleware(token);
@@ -27,7 +27,7 @@ export async function POST(
     .collection("projects")
     .updateOne(
       { _id: new ObjectId(projectId) },
-      { $set: { [`roles.${targetUid}`]: role } }
+      { $set: { [`roles.${targetUid}`]: role } },
     );
 
   return NextResponse.json({ ok: true, updated: { targetUid, role } });

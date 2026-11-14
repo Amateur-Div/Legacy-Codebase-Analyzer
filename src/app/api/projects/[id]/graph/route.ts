@@ -1,17 +1,18 @@
 import { getFileGraph } from "@/app/api/lib/graph/graphStore";
 import { authMiddleware } from "@/lib/auth-server";
+import clientPromise from "@/lib/mongoClient";
 import { NextRequest, NextResponse } from "next/server";
 
 function normalizeFilePath(value: string): string {
   return value.replace(/\\/g, "/").replace(/^\.\/+/, "");
 }
 
-function isValidFilePath(filePath: string): boolean {
+function isValidFilePath(filePath: string) {
   if (!filePath) return false;
-
   if (filePath.startsWith("/")) return false;
 
   const segments = filePath.split("/");
+
   if (segments.includes("..")) return false;
 
   return true;
@@ -19,16 +20,14 @@ function isValidFilePath(filePath: string): boolean {
 
 export async function GET(
   req: NextRequest,
-  context: {
-    params: Promise<{ id: string }>;
-  },
+  context: { params: Promise<{ id: string }> },
 ) {
   try {
     const { id: projectId } = await context.params;
 
     if (!projectId) {
       return NextResponse.json(
-        { error: "Project ID is required" },
+        { error: "Missing project ID" },
         { status: 400 },
       );
     }
@@ -36,26 +35,13 @@ export async function GET(
     const rawFilePath = req.nextUrl.searchParams.get("filePath");
 
     if (!rawFilePath) {
-      return NextResponse.json(
-        {
-          error: "filePath query parameter is required",
-        },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: "Missing file path" }, { status: 400 });
     }
-
-    console.log("id : ", projectId);
-    console.log("File path : ", rawFilePath);
 
     const filePath = normalizeFilePath(rawFilePath);
 
     if (!isValidFilePath(filePath)) {
-      return NextResponse.json(
-        {
-          error: "Invalid filePath",
-        },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: "Invalid file path" }, { status: 400 });
     }
 
     const authorization = req.headers.get("authorization");
@@ -82,17 +68,38 @@ export async function GET(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const graph = await getFileGraph(projectId, filePath, uid);
+    const client = await clientPromise;
+    const db = client.db();
+
+    const project = await db.collection("projects").findOne(
+      {
+        projectId,
+        members: uid,
+      },
+      {
+        projection: {
+          ownerId: 1,
+        },
+      },
+    );
+
+    if (!project) {
+      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    }
+
+    if (typeof project.ownerId !== "string" || !project.ownerId) {
+      console.error("GRAPH_PROJECT_OWNER_MISSING", { projectId });
+
+      return NextResponse.json(
+        { error: "Project owner information is unavailable" },
+        { status: 500 },
+      );
+    }
+
+    const graph = await getFileGraph(projectId, filePath, project.ownerId);
 
     if (!graph) {
-      return NextResponse.json(
-        {
-          error: "Graph not found for selected file",
-          projectId,
-          filePath,
-        },
-        { status: 404 },
-      );
+      return NextResponse.json({ error: "Graph not found" }, { status: 404 });
     }
 
     return NextResponse.json(
@@ -108,12 +115,10 @@ export async function GET(
       },
     );
   } catch (err: any) {
-    console.error("[graph-api] Failed to load file graph:", err);
+    console.error("FILE_GRAPH_FETCH_ERROR", err);
 
     return NextResponse.json(
-      {
-        error: String(err?.message ?? err),
-      },
+      { error: "Failed to fetch file graph" },
       { status: 500 },
     );
   }

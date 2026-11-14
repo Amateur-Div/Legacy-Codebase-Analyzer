@@ -41,7 +41,7 @@ export async function ensureFileGraphIndexes() {
   );
 }
 
-function compactEdgesForStorage(
+export function compactEdgesForStorage(
   nodes: FlowNode[],
   edges: FlowEdge[],
 ): StoredFlowEdge[] {
@@ -51,7 +51,7 @@ function compactEdgesForStorage(
     nodeIndexById.set(node.id, index);
   });
 
-  return edges.map(({ from, to, label }) => {
+  return edges.map(({ id, from, to, label }) => {
     const fromIndex = nodeIndexById.get(from);
     const toIndex = nodeIndexById.get(to);
 
@@ -60,6 +60,7 @@ function compactEdgesForStorage(
     }
 
     return {
+      id,
       from: fromIndex,
       to: toIndex,
       ...(label !== undefined ? { label } : {}),
@@ -67,11 +68,11 @@ function compactEdgesForStorage(
   });
 }
 
-function restoreEdgeIds(
+export function restoreEdgeIds(
   edges: StoredFlowEdge[],
   nodes: FlowNode[],
 ): FlowEdge[] {
-  return edges.map((edge) => {
+  return edges.map((edge, index) => {
     const fromNode = nodes[edge.from];
     const toNode = nodes[edge.to];
 
@@ -85,7 +86,7 @@ function restoreEdgeIds(
       ...edge,
       from: fromNode.id,
       to: toNode.id,
-      id: `${fromNode.id}->${toNode.id}`,
+      id: edge.id ?? `${fromNode.id}->${toNode.id}::${index}`,
     };
   });
 }
@@ -175,7 +176,9 @@ export async function getFileGraph(
     filter.ownerId = ownerId;
   }
 
-  const doc = await db.collection(FILE_GRAPH_COLLECTION).findOne(filter);
+  const doc = await db
+    .collection<FileGraphRecord>(FILE_GRAPH_COLLECTION)
+    .findOne(filter);
 
   if (!doc) {
     return null;

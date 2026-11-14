@@ -6,14 +6,14 @@ import { ObjectId } from "bson";
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> },
 ) {
-  const projectId = params.id;
+  const { id: projectId } = await params;
 
   const token = req.headers.get("authorization")?.replace("Bearer ", "");
   const user = await authMiddleware(token);
 
-  const project = await assertProjectAccess(projectId, user.uid, "owner");
+  await assertProjectAccess(projectId, user.uid, "owner");
 
   const { targetUid } = await req.json();
 
@@ -24,7 +24,7 @@ export async function POST(
   if (targetUid === user.uid) {
     return NextResponse.json(
       { error: "Owner cannot remove themselves" },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
@@ -35,7 +35,7 @@ export async function POST(
     {
       $pull: { members: targetUid } as any,
       $unset: { [`roles.${targetUid}`]: "" },
-    }
+    },
   );
 
   return NextResponse.json({ ok: true, removed: targetUid });

@@ -26,7 +26,14 @@ export function getDagreGraph(nodes: Node[], edges: Edge[], direction = "TB") {
 
   edges.forEach((e) => {
     if (e.source && e.target) {
-      g.setEdge(e.source as string, e.target as string);
+      g.setEdge(
+        e.source,
+        e.target,
+        {
+          label: typeof e.label === "string" ? e.label : "",
+        },
+        e.id,
+      );
     }
   });
 

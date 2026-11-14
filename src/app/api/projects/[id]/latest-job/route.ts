@@ -4,7 +4,7 @@ import { authMiddleware } from "@/lib/auth-server";
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const token = req.nextUrl.searchParams.get("token") || "";

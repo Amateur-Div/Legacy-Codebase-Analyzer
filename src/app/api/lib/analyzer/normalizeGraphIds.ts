@@ -10,12 +10,21 @@ export function normalizeGraphIds(g: FlowGraph, filePath: string) {
     return { ...n, id: localId, file: filePath };
   });
 
+  let edgeCounter = 0;
+
   const edges: FlowEdge[] = g.edges
     .map((e: any) => {
       const from = mapping.get(e.from);
       const to = mapping.get(e.to);
+
       if (!from || !to) return null;
-      return { id: `${from}->${to}`, from, to, label: e.label } as FlowEdge;
+
+      return {
+        id: `${from}->${to}::${edgeCounter++}`,
+        from,
+        to,
+        label: e.label,
+      } as FlowEdge;
     })
     .filter(Boolean) as FlowEdge[];
 

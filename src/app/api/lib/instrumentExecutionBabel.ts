@@ -54,6 +54,8 @@ export function instrumentExecutionBabel(code: string): FlowGraph {
 
         prevNodes = exits;
         parentNode = undefined;
+
+        continue;
       }
 
       const nodeType =

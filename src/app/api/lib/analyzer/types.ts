@@ -33,11 +33,12 @@ export type FlowNode = {
   meta?: Record<string, any>;
 };
 
-export type StoredFlowEdge = {
+export interface StoredFlowEdge {
+  id?: string;
   from: number;
   to: number;
   label?: string;
-};
+}
 
 export type FlowEdge = {
   id: string;
