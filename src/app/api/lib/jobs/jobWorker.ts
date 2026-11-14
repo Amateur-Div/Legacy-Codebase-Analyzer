@@ -1,4 +1,5 @@
 import path from "path";
+import { createHash } from "crypto";
 import clientPromise from "../../../../lib/mongoClient";
 import { saveJob } from "./jobStore";
 import { instrumentExecutionBabel } from "../instrumentExecutionBabel";
@@ -10,6 +11,14 @@ import {
   getFileGraphs,
   saveFileGraphs,
 } from "../graph/graphStore";
+import {
+  deleteStaleFileCallGraphs,
+  getFileCallGraphs,
+  saveFileCallGraphs,
+  saveResolvedFileCallGraphs,
+} from "../graph/fileCallGraphStore";
+import { resolveCallGraph } from "../callGraphResolver";
+import type { CallGraphExtraction } from "../callGraphExtractor";
 import {
   buildFileTree,
   calculateRepositoryInsights,
@@ -328,11 +337,43 @@ export async function runJobStep(job: any) {
       }
     }
 
+    const activeCallGraphPaths: string[] = [];
+    let pendingCallGraphs: Array<{
+      filePath: string;
+      sourceHash: string;
+      graph: CallGraphExtraction;
+    }> = [];
+
+    const flushCallGraphs = async () => {
+      if (!pendingCallGraphs.length) return;
+      await saveFileCallGraphs(job.projectId, job.ownerId, pendingCallGraphs);
+      pendingCallGraphs = [];
+    };
+
     const fileTree = await buildFileTree(
       allFiles,
       async (relativePath, maxBytes) => {
         return reader.readFile(relativePath, maxBytes);
       },
+      async (filePath, graph, source) => {
+        activeCallGraphPaths.push(filePath);
+        pendingCallGraphs.push({
+          filePath,
+          sourceHash: createHash("sha256").update(source).digest("hex"),
+          graph,
+        });
+
+        if (pendingCallGraphs.length >= CHUNK_SIZE) {
+          await flushCallGraphs();
+        }
+      },
+    );
+
+    await flushCallGraphs();
+    await deleteStaleFileCallGraphs(
+      job.projectId,
+      job.ownerId,
+      activeCallGraphPaths,
     );
 
     const insights = calculateRepositoryInsights(fileTree);
@@ -609,6 +650,25 @@ export async function runJobStep(job: any) {
     const fileTree = project?.fileTree || [];
 
     const resolverConfig = project?.resolverConfig ?? {};
+
+    const storedCallGraphs = await getFileCallGraphs(
+      job.projectId,
+      job.ownerId,
+    );
+
+    if (storedCallGraphs.length) {
+      const repoRoot = storedCallGraphs[0].filePath.split("/")[0] ?? "";
+      const resolvedCallGraphs = resolveCallGraph(storedCallGraphs, {
+        repoRoot,
+        resolverConfig,
+      });
+
+      await saveResolvedFileCallGraphs(
+        job.projectId,
+        job.ownerId,
+        resolvedCallGraphs,
+      );
+    }
 
     attachCrossFileImpact(fileTree, resolverConfig);
 

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { ObjectId } from "bson";
 import { authMiddleware } from "@/lib/auth-server";
 import clientPromise from "@/lib/mongoClient";
+import { deleteFileGraphs } from "../lib/graph/graphStore";
+import { deleteFileCallGraphs } from "../lib/graph/fileCallGraphStore";
 
 export async function GET(req: NextRequest) {
   try {
@@ -63,17 +65,17 @@ export async function DELETE(req: NextRequest) {
     if (!project)
       return NextResponse.json({ error: "Not found" }, { status: 404 });
 
+    // Clean dependent analysis records before deleting the owning project.
+    await Promise.all([
+      db.collection("graphs").deleteOne({ projectId: project.projectId }),
+      db.collection("jobs").deleteOne({ projectId: project.projectId }),
+      db.collection("comments").deleteMany({ projectId: id }),
+      db.collection("project_files").deleteMany({ projectId: project.projectId }),
+      deleteFileGraphs(project.projectId, uid),
+      deleteFileCallGraphs(project.projectId, uid),
+    ]);
+
     await db.collection("projects").deleteOne({ _id: new ObjectId(id) });
-
-    await db.collection("graphs").deleteOne({ projectId: project?.projectId });
-
-    await db.collection("jobs").deleteOne({ projectId: project?.projectId });
-
-    await db.collection("comments").deleteMany({ projectId: id });
-
-    await db
-      .collection("project_files")
-      .deleteMany({ projectId: project?.projectId });
 
     return NextResponse.json({ success: true });
   } catch (err) {

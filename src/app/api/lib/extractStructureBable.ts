@@ -1,3 +1,4 @@
+import { extractCallGraphBabel } from "./callGraphExtractor";
 import * as babelParser from "@babel/parser";
 import traverse, { NodePath } from "@babel/traverse";
 import {
@@ -71,6 +72,7 @@ interface ExtractContext {
 }
 
 export interface ExtractStructureResult {
+  callGraph?: ReturnType<typeof extractCallGraphBabel>;
   imports: SymbolInfo[];
   functions: SymbolInfo[];
   classes: SymbolInfo[];
@@ -2160,6 +2162,7 @@ export function extractStructureBabel(
     blocks: sortByStart(ctx.blocks),
     apis: sortByStart(ctx.apis),
     schemas: sortByStart(ctx.schemas),
+    callGraph: extractCallGraphBabel(filePath, code, ast),
     ...(ctx.errors.length ? { errors: ctx.errors } : {}),
   };
 }
