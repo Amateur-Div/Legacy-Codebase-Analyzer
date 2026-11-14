@@ -197,7 +197,7 @@ export function resolveCallGraph(
             filePath: graph.filePath,
             callSiteId: callSite.id,
             kind: "unresolved-export",
-            message: `No statically resolvable export "${callSite.importedBinding.importedName}" in ${targetFile}`,
+            message: `No statically resolvable export "${callSite.importedBinding.importedName}" in ${moduleResolution.path}`,
           });
           continue;
         }
