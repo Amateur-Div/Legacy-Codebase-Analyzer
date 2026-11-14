@@ -199,6 +199,17 @@ export function resolveCallGraph(
 
       if (!targetSymbolId || !resolution) continue;
 
+      const targetFilePath = symbolFileById.get(targetSymbolId);
+      if (!targetFilePath) {
+        diagnostics.push({
+          filePath: graph.filePath,
+          callSiteId: callSite.id,
+          kind: "unresolved-export",
+          message: `Resolved symbol "${targetSymbolId}" is not present in the indexed files`,
+        });
+        continue;
+      }
+
       if (!callSite.callerSymbolId) {
         diagnostics.push({
           filePath: graph.filePath,
@@ -215,7 +226,7 @@ export function resolveCallGraph(
         fromSymbolId: callSite.callerSymbolId,
         toSymbolId: targetSymbolId,
         fromFilePath: graph.filePath,
-        toFilePath: symbolFileById.get(targetSymbolId) ?? graph.filePath,
+        toFilePath: targetFilePath,
         callSiteId: callSite.id,
         line: callSite.line,
         calleeText: callSite.calleeText,
