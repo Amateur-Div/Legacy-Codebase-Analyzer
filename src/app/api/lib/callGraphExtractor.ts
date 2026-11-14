@@ -511,6 +511,13 @@ export function extractCallGraphBabel(
   symbols.sort((a, b) => a.startOffset - b.startOffset);
   callSites.sort((a, b) => a.startOffset - b.startOffset);
 
+  const diagnostics = ((ast as any).errors ?? []).map((error: any) => ({
+    kind: "parse-error" as const,
+    message: error?.message ?? "Babel recovered from a parse error",
+    line: error?.loc?.line,
+    column: error?.loc?.column,
+  }));
+
   return {
     schemaVersion: 1,
     filePath,
@@ -518,6 +525,6 @@ export function extractCallGraphBabel(
     imports,
     exports,
     callSites,
-    diagnostics: [],
+    diagnostics,
   };
 }
