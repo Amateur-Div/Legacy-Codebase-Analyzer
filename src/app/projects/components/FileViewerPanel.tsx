@@ -33,6 +33,7 @@ import {
   ProjectDependencyAnalysis,
 } from "@/app/api/lib/analyzer/types";
 import FlowVisualizer from "./FlowVisualizer";
+import ExecutionFlowExplorer from "./ExecutionFlowExplorer";
 import FileInsightsSidebar from "./FileInsightsSidebar";
 import CodeEditorPanel from "./CodeEditorPanel";
 
@@ -84,7 +85,7 @@ export default function FileViewerPanel({
   getLanguageMeta,
 }: FileViewerPanelProps) {
   const { targetLineNumber, setTargetLineNumber } = useAuth();
-  const [viewMode, setViewMode] = useState<"code" | "graph">("code");
+  const [viewMode, setViewMode] = useState<"code" | "graph" | "execution">("code");
   const [searchTerm, setSearchTerm] = useState<any>("");
   const codeContainerRef = useRef<HTMLDivElement | null>(null);
   const [lastScrolledLine, setLastScrolledLine] = useState<number | null>(null);
@@ -453,10 +454,31 @@ export default function FileViewerPanel({
           >
             Graph
           </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("execution")}
+            className={`px-3 py-1 text-sm rounded-md transition ${
+              viewMode === "execution"
+                ? "bg-background shadow-sm font-medium"
+                : "text-muted-foreground"
+            }`}
+          >
+            Execution Flow
+          </button>
         </div>
 
         <div className="h-[650px] min-h-0 sm:h-[700px] lg:h-[750px]">
-          {viewMode === "code" ? (
+          {viewMode === "execution" ? (
+            <ExecutionFlowExplorer
+              projectId={project.projectId}
+              fileTree={project?.fileTree ?? fileTree}
+              onOpenSource={(filePath, line) => {
+                handleFileClick(filePath);
+                setViewMode("code");
+                setTargetLineNumber(line);
+              }}
+            />
+          ) : viewMode === "code" ? (
             selectedPath ? (
               <div className="grid h-full min-h-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
                 <div className="flex flex-col min-w-0 min-h-0 h-full">
