@@ -96,6 +96,25 @@ describe("extractCallGraphBabel", () => {
   });
 
 
+
+  it("does not mistake imported object methods or dynamic namespace access for direct exports", () => {
+    const result = extractCallGraphBabel(
+      "src/routes/users.ts",
+      `
+        import UserService from "../services/userService";
+        import * as audit from "../services/audit";
+        export function POST(key: string) {
+          UserService.create();
+          audit[key]();
+        }
+      `,
+    );
+
+    expect(result.callSites).toHaveLength(2);
+    expect(result.callSites.every((call) => call.resolution === "unresolved")).toBe(true);
+    expect(result.callSites.every((call) => !call.importedBinding)).toBe(true);
+  });
+
   it("connects local export aliases and default identifier exports to their symbols", () => {
     const result = extractCallGraphBabel(
       "src/services/user.ts",
