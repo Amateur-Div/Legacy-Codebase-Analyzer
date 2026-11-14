@@ -18,6 +18,7 @@ import {
   saveResolvedFileCallGraphs,
 } from "../graph/fileCallGraphStore";
 import { resolveCallGraph } from "../callGraphResolver";
+import type { CallGraphExtraction } from "../callGraphExtractor";
 import {
   buildFileTree,
   calculateRepositoryInsights,
@@ -340,7 +341,7 @@ export async function runJobStep(job: any) {
     let pendingCallGraphs: Array<{
       filePath: string;
       sourceHash: string;
-      graph: NonNullable<import("../callGraphExtractor").CallGraphExtraction>;
+      graph: CallGraphExtraction;
     }> = [];
 
     const flushCallGraphs = async () => {
