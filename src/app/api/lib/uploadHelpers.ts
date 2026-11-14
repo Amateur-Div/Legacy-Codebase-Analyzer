@@ -284,9 +284,16 @@ export type RepositoryFileReader = (
   maxBytes: number,
 ) => Promise<RepositoryFileReadResult>;
 
+export type CallGraphExtractionCallback = (
+  filePath: string,
+  graph: NonNullable<ReturnType<typeof extractStructureBabel>["callGraph"]>,
+  source: string,
+) => void | Promise<void>;
+
 export async function buildFileTree(
   files: string[],
   readFile: RepositoryFileReader,
+  onCallGraph?: CallGraphExtractionCallback,
 ) {
   const tree: any[] = [];
 
@@ -349,6 +356,10 @@ export async function buildFileTree(
                 highlights = extractHighlights(content);
 
                 const symbols = extractStructureBabel(fullPath, content);
+
+                if (symbols.callGraph) {
+                  await onCallGraph?.(fullPath, symbols.callGraph, content);
+                }
 
                 imports = symbols.imports;
                 functions = symbols.functions;
