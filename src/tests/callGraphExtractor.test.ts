@@ -95,6 +95,31 @@ describe("extractCallGraphBabel", () => {
     expect(result.callSites[1].resolution).toBe("unresolved");
   });
 
+
+  it("connects local export aliases and default identifier exports to their symbols", () => {
+    const result = extractCallGraphBabel(
+      "src/services/user.ts",
+      `
+        function createUser() {}
+        const removeUser = () => {};
+        export { createUser as addUser, removeUser as deleteUser };
+        export default createUser;
+      `,
+    );
+
+    const addUser = result.exports.find((entry) => entry.exportedName === "addUser");
+    const deleteUser = result.exports.find((entry) => entry.exportedName === "deleteUser");
+    const defaultExport = result.exports.find((entry) => entry.exportedName === "default");
+
+    expect(addUser?.targetSymbolId).toBe(
+      result.symbols.find((symbol) => symbol.name === "createUser")?.id,
+    );
+    expect(deleteUser?.targetSymbolId).toBe(
+      result.symbols.find((symbol) => symbol.name === "removeUser")?.id,
+    );
+    expect(defaultExport?.targetSymbolId).toBe(addUser?.targetSymbolId);
+  });
+
   it("returns diagnostics for invalid source and an empty result for empty files", () => {
     const invalid = extractCallGraphBabel("src/broken.ts", "function {");
     expect(invalid.diagnostics).toHaveLength(1);
