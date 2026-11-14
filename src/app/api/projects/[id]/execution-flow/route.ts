@@ -1,4 +1,5 @@
 import { getFileCallGraphsByPaths } from "@/app/api/lib/graph/fileCallGraphStore";
+import type { ResolvedCallEdge } from "@/app/api/lib/callGraphResolver";
 import { authMiddleware } from "@/lib/auth-server";
 import clientPromise from "@/lib/mongoClient";
 import { NextRequest, NextResponse } from "next/server";
@@ -198,19 +199,7 @@ export async function GET(
 
     while (frontier.length > 0 && !diagnostics.truncated) {
       const candidates: Array<{
-        edge: (typeof rootGraph extends never ? never : {
-          id: string;
-          type: "calls";
-          fromSymbolId: string;
-          toSymbolId: string;
-          fromFilePath: string;
-          toFilePath: string;
-          callSiteId: string;
-          line: number;
-          calleeText: string;
-          resolution: "same-file" | "imported";
-          confidence: "high";
-        });
+        edge: ResolvedCallEdge;
         depth: number;
       }> = [];
 
@@ -238,11 +227,15 @@ export async function GET(
 
       if (!candidates.length) break;
 
-      const missingPaths = [...new Set(
+      const allMissingPaths = [...new Set(
         candidates
           .map(({ edge }) => edge.toFilePath)
           .filter((filePath) => filePath && !graphsByPath.has(filePath)),
-      )].slice(0, maxNodes);
+      )];
+      if (allMissingPaths.length > maxNodes) {
+        diagnostics.truncated = true;
+      }
+      const missingPaths = allMissingPaths.slice(0, maxNodes);
 
       if (missingPaths.length) {
         const nextGraphs = await getFileCallGraphsByPaths(
