@@ -352,7 +352,7 @@ export async function buildFileTree(
 
               const ext = part.split(".").pop()?.toLowerCase();
 
-              if (["js", "ts", "jsx", "tsx"].includes(ext || "")) {
+              if (["js", "ts", "jsx", "tsx", "mjs", "cjs"].includes(ext || "")) {
                 highlights = extractHighlights(content);
 
                 const symbols = extractStructureBabel(fullPath, content);
