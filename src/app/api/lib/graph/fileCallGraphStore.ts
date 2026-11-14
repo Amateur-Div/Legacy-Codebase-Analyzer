@@ -114,6 +114,44 @@ export async function getFileCallGraphs(
   }));
 }
 
+export type ResolvedFileCallGraph = CallGraphExtraction & {
+  edges: ResolvedCallEdge[];
+  resolutionDiagnostics: CallGraphResolutionResult["diagnostics"];
+};
+
+export async function getFileCallGraphsByPaths(
+  projectId: string,
+  ownerId: string,
+  filePaths: string[],
+): Promise<ResolvedFileCallGraph[]> {
+  const uniquePaths = [...new Set(filePaths)].filter(Boolean);
+  if (!uniquePaths.length) return [];
+
+  await ensureIndexes();
+  const client = await clientPromise;
+  const docs = await client
+    .db()
+    .collection(COLLECTION)
+    .find({
+      ownerId,
+      projectId,
+      filePath: { $in: uniquePaths },
+    })
+    .toArray();
+
+  return docs.map((doc) => ({
+    schemaVersion: doc.schemaVersion,
+    filePath: doc.filePath,
+    symbols: doc.symbols ?? [],
+    imports: doc.imports ?? [],
+    exports: doc.exports ?? [],
+    callSites: doc.callSites ?? [],
+    diagnostics: doc.diagnostics ?? [],
+    edges: doc.edges ?? [],
+    resolutionDiagnostics: doc.resolutionDiagnostics ?? [],
+  }));
+}
+
 export async function saveResolvedFileCallGraphs(
   projectId: string,
   ownerId: string,
