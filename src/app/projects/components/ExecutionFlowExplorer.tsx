@@ -423,11 +423,14 @@ export default function ExecutionFlowExplorer({
                   <p className="text-xs font-semibold text-muted-foreground">
                     Called by ({selectedIncoming.length})
                   </p>
-                  {selectedIncoming.slice(0, 8).map((edge) => (
-                    <p key={edge.id} className="break-all text-xs">
-                      {edge.calleeText} · line {edge.line}
-                    </p>
-                  ))}
+                  {selectedIncoming.slice(0, 8).map((edge) => {
+                    const caller = flow.nodes.find((node) => node.id === edge.from);
+                    return (
+                      <p key={edge.id} className="break-all text-xs">
+                        {caller?.name ?? "Unknown caller"} · line {edge.line}
+                      </p>
+                    );
+                  })}
                   {selectedIncoming.length === 0 && (
                     <p className="text-xs text-muted-foreground">No callers in this explored flow.</p>
                   )}
