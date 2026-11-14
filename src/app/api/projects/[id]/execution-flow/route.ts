@@ -124,15 +124,23 @@ export async function GET(
       );
     }
 
-    const rootSymbol = rootGraph.symbols.find((symbol) =>
-      entrySymbolId
-        ? symbol.id === entrySymbolId
-        : symbol.name === entrySymbolName,
-    );
+    const matchingSymbols = entrySymbolId
+      ? rootGraph.symbols.filter((symbol) => symbol.id === entrySymbolId)
+      : rootGraph.symbols.filter((symbol) => symbol.name === entrySymbolName);
+    const preferredSymbols =
+      matchingSymbols.length > 1
+        ? matchingSymbols.filter((symbol) => symbol.isExported)
+        : matchingSymbols;
+    const rootSymbol =
+      preferredSymbols.length === 1 ? preferredSymbols[0] : undefined;
+
     if (!rootSymbol) {
       return NextResponse.json(
         {
-          error: "Entry symbol not found in the selected file",
+          error:
+            matchingSymbols.length > 1
+              ? "Entry symbol name is ambiguous; select a specific symbol ID"
+              : "Entry symbol not found in the selected file",
           availableSymbols: rootGraph.symbols.map((symbol) => ({
             id: symbol.id,
             name: symbol.name,
@@ -141,7 +149,7 @@ export async function GET(
             startLine: symbol.startLine,
           })),
         },
-        { status: 404 },
+        { status: matchingSymbols.length > 1 ? 409 : 404 },
       );
     }
 
@@ -208,10 +216,15 @@ export async function GET(
         const graph = graphsByPath.get(current.filePath);
         if (!graph) continue;
 
+        const unresolvedCallIds = new Set(
+          graph.resolutionDiagnostics.map((diagnostic) => diagnostic.callSiteId),
+        );
         diagnostics.unresolvedCalls += graph.callSites.filter(
           (call) =>
             call.callerSymbolId === current.symbolId &&
-            (call.resolution === "unresolved" || call.resolution === "dynamic"),
+            (call.resolution === "unresolved" ||
+              call.resolution === "dynamic" ||
+              unresolvedCallIds.has(call.id)),
         ).length;
 
         for (const edge of graph.edges) {
